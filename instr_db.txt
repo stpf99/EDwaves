@@ -1,0 +1,26 @@
+# Format: name;family;pitch_range_low;pitch_range_high;attack;decay;sustain;release;special1;special2;default_param1;default_param2;default_param3;default_param4
+# Special params vary by instrument family:
+# String: vibrato_rate;vibrato_depth
+# Wind: breath_noise;vibrato_rate
+# Percussion: resonance;damping
+# Electronic: wave_shape;filter_cutoff
+# Default params: These are instrument-specific initial values for the most relevant parameters
+
+# String Instruments
+violin;string;196;3136;0.01;0.1;0.7;0.1;5;0.03;0.5;0.6;0.7;0.4
+viola;string;130.81;2093;0.02;0.15;0.7;0.15;4.5;0.035;0.4;0.5;0.6;0.3
+cello;string;65.41;1046.5;0.03;0.2;0.8;0.2;4;0.04;0.3;0.4;0.5;0.2
+double_bass;string;41.20;246.94;0.04;0.25;0.8;0.25;3.5;0.045;0.2;0.3;0.4;0.1
+
+# Wind Instruments
+flute;wind;261.63;2093;0.02;0.1;0.7;0.1;0.05;5;0.4;0.5;0.6;0.3
+oboe;wind;246.94;1568;0.03;0.1;0.8;0.1;0.07;4.5;0.5;0.6;0.7;0.4
+
+# Percussion Instruments
+drums_kick;percussion;30;100;0.001;0.1;0.1;0.2;0.8;0.7;0.9;0.8;0.1;0.2
+drums_snare;percussion;100;500;0.001;0.1;0.1;0.1;0.9;0.5;0.8;0.7;0.2;0.1
+
+# Electronic Instruments
+synthesizer;electronic;16.35;7902.13;0.01;0.1;0.7;0.1;sine;1000;0.5;0.6;0.7;0.8
+theremin;electronic;65.41;1661.22;0.01;0.05;0.9;0.05;sine;500;0.4;0.5;0.9;0.6
+
