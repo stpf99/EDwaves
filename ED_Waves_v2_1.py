@@ -31,18 +31,117 @@ TOOL_SELECT  = "select"
 
 
 # ──────────────────────────────────────────────────────────────────
-#  Klasa segmentu krzywej
+#  Tryby korekcji
 # ──────────────────────────────────────────────────────────────────
-class Segment:
-    """Para węzłów p0→p1 + typ linii + uchwyty Béziera cp0/cp1."""
-    def __init__(self, p0, p1, line_type=LINE_BEZIER):
-        self.p0 = list(p0)
-        self.p1 = list(p1)
+CORR_MUL = "mul"   # mnożnik amplitudy: środek ekranu = 1.0 (neutral), góra >1, dół <1
+CORR_ADD = "add"   # addytywne DC:       środek ekranu = 0.0 (neutral), góra +1, dół -1
+
+# ──────────────────────────────────────────────────────────────────
+#  Warstwa korekcji (niedestrukcyjna)
+# ──────────────────────────────────────────────────────────────────
+class CorrectionLayer:
+    """Odcinek narysowany na istniejącej fali — kształtuje ją, nie zastępuje.
+
+    Interpretacja Y zależy od mode:
+      MUL: środek canvas = 1.0 (bez zmiany), góra = MUL_MAX (wzmocnienie),
+           dół = 0.0 (całkowite wyciszenie).
+      ADD: środek canvas = 0.0 (bez zmiany), góra = +1.0, dół = -1.0.
+
+    Poza zakresem [t0..t1] warstwa ma wartość neutralną (mul=1, add=0).
+    Przejście na krawędziach jest wygładzane cosinus-fade o szerokości FADE_W
+    próbek — brak kliknięć/artefaktów.
+    """
+    FADE_W   = 64      # próbki wygładzenia na krawędziach (cosinus fade)
+    MUL_MAX  = 3.0     # maksymalne wzmocnienie przy mul (góra ekranu)
+
+    def __init__(self, p0, p1, line_type=LINE_BEZIER, mode=CORR_MUL):
+        self.p0        = list(p0)
+        self.p1        = list(p1)
         self.line_type = line_type
+        self.mode      = mode
         dx = (p1[0] - p0[0]) / 3.0
-        self.cp0 = [p0[0] + dx, p0[1]]
-        self.cp1 = [p1[0] - dx, p1[1]]
-        self.selected = False
+        self.cp0       = [p0[0] + dx, p0[1]]
+        self.cp1       = [p1[0] - dx, p1[1]]
+        self.selected  = False
+        self.enabled   = True
+
+    def _curve_values(self, ox, oy, cw, ch, n_seg):
+        """Zwraca tablicę n_seg wartości krzywej w układzie znormalizowanym
+        odpowiednim dla trybu (MUL: [0..MUL_MAX], ADD: [-1..+1])."""
+        if self.line_type == LINE_BEZIER:
+            ts = np.linspace(0.0, 1.0, n_seg)
+            # Y w px → znormalizuj do [−1..+1] względem środka
+            def yn(py):
+                return (oy + ch / 2 - py) / (ch / 2)
+            y0   = yn(self.p0[1])
+            y1   = yn(self.p1[1])
+            ycp0 = yn(self.cp0[1])
+            ycp1 = yn(self.cp1[1])
+            norm = ((1-ts)**3 * y0
+                    + 3*(1-ts)**2*ts * ycp0
+                    + 3*(1-ts)*ts**2 * ycp1
+                    + ts**3 * y1)
+        elif self.line_type == LINE_LINEAR:
+            def yn(py): return (oy + ch/2 - py) / (ch/2)
+            ts   = np.linspace(0.0, 1.0, n_seg)
+            norm = yn(self.p0[1]) + ts * (yn(self.p1[1]) - yn(self.p0[1]))
+        elif self.line_type == LINE_STEP:
+            def yn(py): return (oy + ch/2 - py) / (ch/2)
+            ts   = np.linspace(0.0, 1.0, n_seg)
+            norm = np.where(ts < 0.5, yn(self.p0[1]), yn(self.p1[1]))
+        else:
+            norm = np.zeros(n_seg)
+
+        if self.mode == CORR_MUL:
+            # norm ∈ [−1..+1] → mul ∈ [0..MUL_MAX]
+            # −1 → 0.0,  0 → 1.0,  +1 → MUL_MAX
+            vals = np.where(norm >= 0,
+                            1.0 + norm * (self.MUL_MAX - 1.0),
+                            1.0 + norm)           # 0..1 dla norm ∈ [−1,0]
+        else:  # CORR_ADD
+            vals = norm                            # [-1..+1]
+        return vals
+
+    def apply(self, wave, ox, oy, cw, ch):
+        """Aplikuje korekcję do tablicy wave (in-place kopia), zwraca nową tablicę."""
+        if not self.enabled:
+            return wave.copy()
+        n = len(wave)
+        x0px, x1px = self.p0[0], self.p1[0]
+        if x1px < x0px:
+            x0px, x1px = x1px, x0px
+
+        t0 = max(0.0, min(1.0, (x0px - ox) / max(cw, 1)))
+        t1 = max(0.0, min(1.0, (x1px - ox) / max(cw, 1)))
+        i0 = int(t0 * n)
+        i1 = int(t1 * n)
+        if i1 <= i0:
+            return wave.copy()
+
+        n_seg  = i1 - i0
+        vals   = self._curve_values(ox, oy, cw, ch, n_seg)
+
+        # cosinus fade na krawędziach — unika kliknięć
+        fade   = min(self.FADE_W, n_seg // 4)
+        if fade > 1:
+            ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, fade))
+            if self.mode == CORR_MUL:
+                # ramp od 1 do val i od val do 1
+                vals[:fade]  = 1.0 + ramp * (vals[:fade]  - 1.0)
+                vals[-fade:] = 1.0 + ramp[::-1] * (vals[-fade:] - 1.0)
+            else:
+                vals[:fade]  = ramp * vals[:fade]
+                vals[-fade:] = ramp[::-1] * vals[-fade:]
+
+        out = wave.copy()
+        if self.mode == CORR_MUL:
+            out[i0:i1] = wave[i0:i1] * vals
+        else:
+            out[i0:i1] = wave[i0:i1] + vals
+        return out
+
+# zachowaj alias dla kompatybilności z częścią UI która używa nazwy Segment
+Segment = CorrectionLayer
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -265,7 +364,9 @@ class WaveformEditor(Gtk.Window):
         # ── pasek statusu ─────────────────────────────────────────
         self.statusbar = Gtk.Label(label="Gotowy  |  ✏ Draw  |  ~ Bezier")
         self.statusbar.set_xalign(0)
-        self.statusbar.set_border_width(3)
+        self.statusbar.set_margin_start(3)
+        self.statusbar.set_margin_top(2)
+        self.statusbar.set_margin_bottom(2)
         vbox.pack_start(self.statusbar, False, False, 0)
 
     # ══════════════════════════════════════════════════════════════
