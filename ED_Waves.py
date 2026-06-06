@@ -1,13 +1,16 @@
 """
-ED_Waves v3
+ED_Waves v4
 ===========
-• Każda fala (generowana / wczytana) dostaje automatyczne punkty kontrolne
-  na zero-crossingach i ekstremach lokalnych.
-• Modyfikacje (warstwy korekcji MUL/ADD) działają NA punktach kontrolnych
-  → potem fala jest rekonstruowana ze zmodyfikowanych CP → opcjonalny DSP post.
-• Profile dźwięczności: synth (lead/pad/bass/pluck/arp), perkusja (kick/snare/
-  hat/tom/clap), efekty (distort/bitcrush/warm/bright).
-• Panel prędkości (velocity) pod edytorem — naciągana linia.
+Nowości v4:
+• SampleStore — format JSON próbki trzymany w pamięci, stabilizuje brzmienie
+  między sekcjami (ChaosPad → Edytor i z powrotem).
+• MIDIEngine — wybór urządzenia MIDI z GUI, note on/off, pitch bend,
+  modulation wheel (CC1), CC7 (volume), CC64 (sustain) reagują na bieżąco.
+• Naprawa edytora — zaznaczanie obszaru punktów CP do modyfikacji działa
+  poprawnie; ikony narzędzi uproszczone do symboli.
+• Suwak "End to" pod obszarem zapętlania — ogranicza odsłuch do zadanego %.
+• Typy przenikania między strefami — ostre (hard) lub zachodzące (crossfade)
+  jako wybór przy każdym zestawieniu stref.
 """
 
 import gi
@@ -17,21 +20,207 @@ import cairo
 import numpy as np
 import scipy.io.wavfile as wav
 from scipy.signal import find_peaks
-import random, tempfile, os, math
+import random, tempfile, os, math, json, threading, time
 
-# Chaos Pad (opcjonalny — wymagany chaos_pad.py w tym samym katalogu)
+# ── Chaos Pad (opcjonalny) ────────────────────────────────────────
 try:
     from chaos_pad import ChaosPadWindow as _ChaosPadWindow
     CHAOS_PAD_OK = True
 except ImportError:
     CHAOS_PAD_OK = False
 
+# ── pygame ────────────────────────────────────────────────────────
 try:
     import pygame
     pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=2048)
     PYGAME_OK = True
 except Exception:
     PYGAME_OK = False
+
+# ── python-rtmidi ─────────────────────────────────────────────────
+try:
+    import rtmidi
+    RTMIDI_OK = True
+except ImportError:
+    RTMIDI_OK = False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SampleStore — centralny format próbki (JSON w pamięci)
+# ═══════════════════════════════════════════════════════════════════
+class SampleStore:
+    """
+    Trzyma pełny opis próbki jako słownik → JSON.
+    Dzięki temu generacja w ChaosPad i w Edytorze używa tych samych
+    parametrów i brzmi identycznie przy każdym odtworzeniu.
+
+    Struktura:
+    {
+      "source": "chaos_pad" | "generator" | "import" | "editor",
+      "wtype":  nazwa fali lub "chaos_pad",
+      "duration": float,            # sekundy
+      "sr": int,                    # sample rate
+      "params": {...},              # parametry syntezatora (chaos_pad / generator)
+      "wave_b64": str | None,       # base64-encoded float32 LE (opcjonalny cache)
+      "cps": [[idx, amp], ...],     # punkty kontrolne
+      "zones": [...],               # strefy loopowania
+      "vel_nodes": [[t, v], ...],   # krzywa velocity
+      "created_at": float,          # timestamp
+    }
+    """
+    VERSION = 4
+
+    def __init__(self):
+        self._store: dict = self._blank()
+
+    def _blank(self) -> dict:
+        return {
+            "version": self.VERSION,
+            "source": "none",
+            "wtype": "sine",
+            "duration": 1.0,
+            "sr": 44100,
+            "params": {},
+            "cps": [],
+            "zones": [],
+            "vel_nodes": [[0.0, 1.0], [1.0, 1.0]],
+            "created_at": time.time(),
+        }
+
+    # ── gettery / settery ─────────────────────────────────────────
+    def get(self, key, default=None):
+        return self._store.get(key, default)
+
+    def set(self, key, value):
+        self._store[key] = value
+        self._store["modified_at"] = time.time()
+
+    def update_from_wave(self, wave: np.ndarray, cps: list,
+                         source: str, sr: int = 44100, **kwargs):
+        """Aktualizuje store po zmianie fali."""
+        self._store.update({
+            "source": source,
+            "sr": sr,
+            "cps": [list(c) for c in cps],
+            "created_at": time.time(),
+            **kwargs
+        })
+
+    def update_cps(self, cps: list):
+        self._store["cps"] = [list(c) for c in cps]
+
+    def update_zones(self, zones: list):
+        self._store["zones"] = [dict(z) for z in zones]
+
+    def update_vel(self, vel_nodes: list):
+        self._store["vel_nodes"] = [list(n) for n in vel_nodes]
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self._store, indent=indent, ensure_ascii=False)
+
+    def from_json(self, text: str):
+        self._store = json.loads(text)
+
+    def save(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.to_json(indent=2))
+
+    def load(self, path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            self.from_json(f.read())
+
+    def summary(self) -> str:
+        src = self._store.get("source","?")
+        wt  = self._store.get("wtype","?")
+        dur = self._store.get("duration", 0)
+        cps = len(self._store.get("cps", []))
+        return f"[{src}] {wt} {dur:.2f}s  CP={cps}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MIDIEngine — obsługa urządzenia MIDI
+# ═══════════════════════════════════════════════════════════════════
+class MIDIEngine:
+    """
+    Otwiera wybrany port MIDI i wywołuje callbacki:
+      on_note_on(note, velocity)
+      on_note_off(note)
+      on_pitchbend(value)   # -1.0..+1.0
+      on_cc(cc, value)      # 0..127
+    """
+    def __init__(self):
+        self._midiin = None
+        self._port_idx = -1
+        self.on_note_on   = None
+        self.on_note_off  = None
+        self.on_pitchbend = None
+        self.on_cc        = None
+        self._sustain     = False
+
+    def list_ports(self) -> list:
+        if not RTMIDI_OK:
+            return []
+        try:
+            m = rtmidi.MidiIn()
+            ports = m.get_ports()
+            del m
+            return ports
+        except Exception:
+            return []
+
+    def open(self, idx: int) -> bool:
+        if not RTMIDI_OK:
+            return False
+        self.close()
+        try:
+            self._midiin = rtmidi.MidiIn()
+            self._midiin.open_port(idx)
+            self._midiin.set_callback(self._callback)
+            self._midiin.ignore_types(sysex=True, timing=True, active_sense=True)
+            self._port_idx = idx
+            return True
+        except Exception as e:
+            print(f"MIDI open error: {e}")
+            self._midiin = None
+            return False
+
+    def close(self):
+        if self._midiin:
+            try:
+                self._midiin.close_port()
+            except Exception:
+                pass
+            self._midiin = None
+        self._port_idx = -1
+
+    def _callback(self, message, data=None):
+        msg, dt = message
+        if not msg:
+            return
+        status = msg[0] & 0xF0
+        ch     = msg[0] & 0x0F
+
+        if status == 0x90:          # Note On
+            note = msg[1]; vel = msg[2]
+            if vel == 0:
+                if self.on_note_off: self.on_note_off(note)
+            else:
+                if self.on_note_on:  self.on_note_on(note, vel)
+
+        elif status == 0x80:        # Note Off
+            note = msg[1]
+            if self.on_note_off: self.on_note_off(note)
+
+        elif status == 0xB0:        # Control Change
+            cc = msg[1]; val = msg[2]
+            if self.on_cc: self.on_cc(cc, val)
+
+        elif status == 0xE0:        # Pitch Bend
+            lsb = msg[1]; msb = msg[2]
+            raw = (msb << 7) | lsb   # 0..16383, środek=8192
+            norm = (raw - 8192) / 8192.0
+            if self.on_pitchbend: self.on_pitchbend(norm)
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Stałe UI
@@ -236,43 +425,36 @@ def _reg(name, cps_fn=None, dsp_fn=None):
 
 SR = 44100
 
-# lead
 def _lead_c(cps,n):
     env=_adsr(n,0.005,0.05,0.8,0.1,SR)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("lead", _lead_c, lambda w,sr: _normalize(_soft(w,1.4)))
 
-# pad
 def _pad_c(cps,n):
     env=_adsr(n,0.3,0.1,0.9,0.5,SR)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("pad", _pad_c, lambda w,sr: _normalize(_lp(w,4000,sr,2)))
 
-# bass
 def _bass_c(cps,n):
     env=_adsr(n,0.01,0.08,0.85,0.15,SR)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("bass", _bass_c, lambda w,sr: _normalize(_soft(_lp(w,2500,sr,2),1.8)))
 
-# pluck
 def _pluck_c(cps,n):
     env=_adsr(n,0.002,0.25,0.0,0.05,SR)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("pluck", _pluck_c, lambda w,sr: _normalize(_hp(w,80,sr)))
 
-# arp
 def _arp_c(cps,n):
     gate=np.ones(n); gate[n//2:]=0.0
     for cp in cps: cp[1]*=gate[min(cp[0],n-1)]
 _reg("arp", _arp_c, None)
 
-# kick
 def _kick_c(cps,n):
     t=np.arange(n)/SR; env=np.exp(-t*18)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("kick", _kick_c, lambda w,sr: _normalize(_soft(_lp(w,120,sr,2)*1.5,2.0)))
 
-# snare
 def _snare_c(cps,n):
     t=np.arange(n)/SR; env=np.exp(-t*30)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
@@ -281,19 +463,16 @@ def _snare_d(w,sr):
     return _normalize(_hp(w+noise,200,sr))
 _reg("snare", _snare_c, _snare_d)
 
-# hat
 def _hat_c(cps,n):
     t=np.arange(n)/SR; env=np.exp(-t*80)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("hat", _hat_c, lambda w,sr: _normalize(_hp(w,6000,sr,2)))
 
-# tom
 def _tom_c(cps,n):
     t=np.arange(n)/SR; env=np.exp(-t*12)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
 _reg("tom", _tom_c, lambda w,sr: _normalize(_lp(_soft(w,1.2),800,sr,2)))
 
-# clap
 def _clap_c(cps,n):
     t=np.arange(n)/SR; env=np.exp(-t*40)
     for cp in cps: cp[1]*=env[min(cp[0],n-1)]
@@ -302,7 +481,6 @@ def _clap_d(w,sr):
     return _normalize(_hp(w*0.3+noise*0.7,500,sr))
 _reg("clap", _clap_c, _clap_d)
 
-# efekty — tylko DSP
 _reg("distort",  None, lambda w,sr: _normalize(_soft(w,4.0)))
 _reg("bitcrush", None, lambda w,sr: _normalize(_bitcrush(w,5)))
 _reg("warm",     None, lambda w,sr: _normalize(_lp(w,8000,sr,2)*1.1))
@@ -337,13 +515,71 @@ def generate_base_wave(wtype, duration, sr=44100):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Główna klasa
+#  Dialog wyboru urządzenia MIDI
+# ═══════════════════════════════════════════════════════════════════
+class MIDIDeviceDialog(Gtk.Dialog):
+    def __init__(self, parent, ports):
+        super().__init__(title="Wybór urządzenia MIDI", parent=parent,
+                         flags=Gtk.DialogFlags.MODAL)
+        self.set_default_size(420, 280)
+        self.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_CONNECT, Gtk.ResponseType.OK
+        )
+        self.selected_idx = -1
+
+        box = self.get_content_area()
+        box.set_spacing(8); box.set_border_width(10)
+
+        if not RTMIDI_OK:
+            box.add(Gtk.Label(label="Brak python-rtmidi.\nZainstaluj: pip install python-rtmidi"))
+            return
+
+        if not ports:
+            box.add(Gtk.Label(label="Nie znaleziono urządzeń MIDI."))
+            return
+
+        box.add(Gtk.Label(label="Dostępne porty MIDI:"))
+        self.liststore = Gtk.ListStore(int, str)
+        for i, p in enumerate(ports):
+            self.liststore.append([i, p])
+
+        tv = Gtk.TreeView(model=self.liststore)
+        tv.set_headers_visible(True)
+        tv.append_column(Gtk.TreeViewColumn("#",    Gtk.CellRendererText(), text=0))
+        tv.append_column(Gtk.TreeViewColumn("Port", Gtk.CellRendererText(), text=1))
+        tv.connect("row-activated", self._row_activated)
+
+        sel = tv.get_selection()
+        sel.set_mode(Gtk.SelectionMode.SINGLE)
+        sel.connect("changed", self._sel_changed)
+        if len(ports) > 0:
+            sel.select_path(Gtk.TreePath.new_first())
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_size_request(-1, 160)
+        sw.add(tv)
+        box.add(sw)
+        box.show_all()
+
+    def _sel_changed(self, sel):
+        model, it = sel.get_selected()
+        if it:
+            self.selected_idx = model[it][0]
+
+    def _row_activated(self, tv, path, col):
+        self.response(Gtk.ResponseType.OK)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Główna klasa WaveformEditor
 # ═══════════════════════════════════════════════════════════════════
 class WaveformEditor(Gtk.Window):
     def __init__(self):
-        Gtk.Window.__init__(self, title="ED_Waves v3")
-        self.set_default_size(1400, 820)
-        self.connect("destroy", Gtk.main_quit)
+        Gtk.Window.__init__(self, title="ED_Waves v4")
+        self.set_default_size(1440, 900)
+        self.connect("destroy", self._on_destroy)
 
         self.sample_rate  = 44100
         self.zoom_level   = 1.0
@@ -361,6 +597,8 @@ class WaveformEditor(Gtk.Window):
         self.drag_offset   = (0,0)
         self.sel_rect_s    = None
         self.sel_rect_e    = None
+        # CP zaznaczone przez rect-select
+        self.sel_cp_set    = set()
 
         self.current_tool  = TOOL_DRAW
         self.current_line  = LINE_BEZIER
@@ -370,20 +608,45 @@ class WaveformEditor(Gtk.Window):
 
         self.pre_profile   = None
         self.post_profile  = None
+        self.post_dsp_name = None   # non-destructive: nazwa profilu post-DSP
 
         self.vel_nodes     = [[0.0,1.0],[1.0,1.0]]
         self.vel_drag_idx  = None
         self.vel_apply     = True
         self.live_play     = False
 
-        # ── strefy loopowania ─────────────────────────────────────
+        # strefy loopowania
         self.zones          = []
         self.zone_drag      = None
         self.zone_sel_idx   = None
         self.zone_mode      = 'sequential'
         self.zone_rendered  = np.array([])
+        # Typ przenikania między strefami (globalny domyślny)
+        self.zone_crossfade = 'sharp'   # 'sharp' lub 'crossfade'
+        # End-to suwak (0.0..1.0)
+        self.play_end_frac  = 1.0
 
+        # SampleStore
+        self.store = SampleStore()
+
+        # MIDI
+        self.midi = MIDIEngine()
+        self.midi.on_note_on   = self._midi_note_on
+        self.midi.on_note_off  = self._midi_note_off
+        self.midi.on_pitchbend = self._midi_pitchbend
+        self.midi.on_cc        = self._midi_cc
+        self._midi_pitch_bend  = 0.0  # -1..+1
+        self._midi_modulation  = 0.0  # 0..1
+        self._midi_volume      = 1.0  # 0..1
+        self._midi_sustain     = False
+        self._midi_playing_note = None
+
+        self._chaos_pad_win = None
         self._build_ui()
+
+    def _on_destroy(self, widget):
+        self.midi.close()
+        Gtk.main_quit()
 
     # ════════════════════════ UI ══════════════════════════════════
     def _build_ui(self):
@@ -394,43 +657,82 @@ class WaveformEditor(Gtk.Window):
         tb1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         tb1.set_border_width(3); root.pack_start(tb1,False,False,0)
 
+        # Narzędzia — uproszczone ikony symboliczne
         tg=None
-        for lbl,t in [("✏ Draw",TOOL_DRAW),("✋ Edit",TOOL_EDIT),("⬚ Select",TOOL_SELECT)]:
+        for lbl,t in [("✏",TOOL_DRAW),("⊙",TOOL_EDIT),("⬚",TOOL_SELECT)]:
             b=Gtk.RadioButton.new_with_label_from_widget(tg,lbl)
             if tg is None: tg=b
-            b.connect("toggled",self._on_tool,t); tb1.pack_start(b,False,False,0)
+            b.set_tooltip_text({"✏":"Rysuj warstwę korekcji",
+                                "⊙":"Edytuj punkt",
+                                "⬚":"Zaznacz obszar"}[lbl])
+            b.connect("toggled",self._on_tool,t)
+            tb1.pack_start(b,False,False,0)
 
         tb1.pack_start(_sep(),False,False,4)
         lg=None
-        for lbl,lt in [("~ Bézier",LINE_BEZIER),("/ Linia",LINE_LINEAR),("⌐ Schodek",LINE_STEP)]:
+        for lbl,lt,tip in [("~",LINE_BEZIER,"Bézier"),
+                            ("∕",LINE_LINEAR,"Linia prosta"),
+                            ("⌐",LINE_STEP,  "Schodek")]:
             b=Gtk.RadioButton.new_with_label_from_widget(lg,lbl)
             if lg is None: lg=b
-            b.connect("toggled",self._on_linetype,lt); tb1.pack_start(b,False,False,0)
+            b.set_tooltip_text(tip)
+            b.connect("toggled",self._on_linetype,lt)
+            tb1.pack_start(b,False,False,0)
 
         tb1.pack_start(_sep(),False,False,4)
         cg=None
-        for lbl,cm in [("MUL ×",CORR_MUL),("ADD ±",CORR_ADD)]:
+        for lbl,cm,tip in [("×",CORR_MUL,"MUL: mnożnik amplitudy"),
+                            ("±",CORR_ADD,"ADD: dodawanie amplitudy")]:
             b=Gtk.RadioButton.new_with_label_from_widget(cg,lbl)
             if cg is None: cg=b
-            b.connect("toggled",self._on_corrmode,cm); tb1.pack_start(b,False,False,0)
+            b.set_tooltip_text(tip)
+            b.connect("toggled",self._on_corrmode,cm)
+            tb1.pack_start(b,False,False,0)
 
         tb1.pack_start(_sep(),False,False,4)
-        for lbl,cb in [("▶",self.on_play),("⏹",self.on_stop),("⟳ Live",self._toggle_live),
-                       ("💾 WAV",self.on_save_wav),("📂 Import",self.on_import_wav),
-                       ("🗑 Warstwy",self._clear_layers)]:
-            b=Gtk.Button(label=lbl); b.connect("clicked",cb); tb1.pack_start(b,False,False,0)
+        for lbl,cb,tip in [("▶","on_play","Play waveform"),
+                            ("⏹","on_stop","Stop"),
+                            ("⟳","_toggle_live","Live re-play"),
+                            ("💾","on_save_wav","Zapisz WAV"),
+                            ("📂","on_import_wav","Wczytaj WAV"),
+                            ("📋","_save_json","Zapisz JSON próbki"),
+                            ("🗑","_clear_layers","Wyczyść warstwy")]:
+            b=Gtk.Button(label=lbl)
+            b.set_tooltip_text(tip)
+            b.connect("clicked",getattr(self,cb))
+            tb1.pack_start(b,False,False,0)
 
         tb1.pack_start(_sep(),False,False,4)
-        tb1.pack_start(Gtk.Label(label="px/próbka:"),False,False,0)
-        self.sw_spin=Gtk.SpinButton(); self.sw_spin.set_range(1,20); self.sw_spin.set_value(2)
+        tb1.pack_start(Gtk.Label(label="px/prb:"),False,False,0)
+        self.sw_spin=Gtk.SpinButton()
+        self.sw_spin.set_range(1,20); self.sw_spin.set_value(2)
         self.sw_spin.set_increments(1,2)
         self.sw_spin.connect("value-changed",lambda s:setattr(self,'sample_w_px',int(s.get_value())))
         tb1.pack_start(self.sw_spin,False,False,0)
 
-        chk=Gtk.CheckButton(label="Pokaż CP"); chk.set_active(True)
+        chk=Gtk.CheckButton(label="CP"); chk.set_active(True)
+        chk.set_tooltip_text("Pokaż punkty kontrolne")
         chk.connect("toggled",lambda w:[setattr(self,'show_cps',w.get_active()),
                                         self.drawing_area.queue_draw()])
         tb1.pack_start(chk,False,False,0)
+
+        # MIDI button
+        tb1.pack_start(_sep(),False,False,4)
+        midi_btn = Gtk.Button(label="🎹 MIDI")
+        midi_btn.set_tooltip_text("Wybierz urządzenie MIDI")
+        midi_btn.connect("clicked", self._open_midi_dialog)
+        tb1.pack_start(midi_btn, False,False,0)
+        self.midi_status_lbl = Gtk.Label(label="⬤ OFF")
+        self.midi_status_lbl.set_markup('<span foreground="red">⬤ OFF</span>')
+        tb1.pack_start(self.midi_status_lbl, False,False,2)
+
+        # MIDI indicators
+        self.midi_pb_lbl  = Gtk.Label(label="PB:  0.00")
+        self.midi_mod_lbl = Gtk.Label(label="MOD:0.00")
+        self.midi_note_lbl= Gtk.Label(label="NOTE:---")
+        for lbl in [self.midi_pb_lbl, self.midi_mod_lbl, self.midi_note_lbl]:
+            lbl.set_width_chars(10)
+            tb1.pack_start(lbl, False,False,0)
 
         # ── pasek 2: generator + profile ─────────────────────────
         tb2=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=4)
@@ -451,88 +753,101 @@ class WaveformEditor(Gtk.Window):
         tb2.pack_start(bg,False,False,0)
 
         tb2.pack_start(_sep(),False,False,6)
-        tb2.pack_start(Gtk.Label(label="Pre-profil:"),False,False,0)
+        tb2.pack_start(Gtk.Label(label="Pre:"),False,False,0)
         self.pre_combo=Gtk.ComboBoxText(); self.pre_combo.append_text("(brak)")
         for p in SoundProfile.names(): self.pre_combo.append_text(p)
         self.pre_combo.set_active(0); tb2.pack_start(self.pre_combo,False,False,0)
-        bp=Gtk.Button(label="▶ Pre"); bp.connect("clicked",self._apply_pre); tb2.pack_start(bp,False,False,0)
+        bp=Gtk.Button(label="▶"); bp.set_tooltip_text("Zastosuj Pre-profil")
+        bp.connect("clicked",self._apply_pre); tb2.pack_start(bp,False,False,0)
 
         tb2.pack_start(_sep(),False,False,4)
-        tb2.pack_start(Gtk.Label(label="Post-profil:"),False,False,0)
+        tb2.pack_start(Gtk.Label(label="Post:"),False,False,0)
         self.post_combo=Gtk.ComboBoxText(); self.post_combo.append_text("(brak)")
         for p in SoundProfile.names(): self.post_combo.append_text(p)
         self.post_combo.set_active(0); tb2.pack_start(self.post_combo,False,False,0)
-        bp2=Gtk.Button(label="▶ Post"); bp2.connect("clicked",self._apply_post); tb2.pack_start(bp2,False,False,0)
+        bp2=Gtk.Button(label="▶"); bp2.set_tooltip_text("Zastosuj Post-profil DSP")
+        bp2.connect("clicked",self._apply_post); tb2.pack_start(bp2,False,False,0)
 
-        br=Gtk.Button(label="↩ Reset"); br.connect("clicked",self._reset_all); tb2.pack_start(br,False,False,0)
+        br=Gtk.Button(label="↩"); br.set_tooltip_text("Reset do oryginału")
+        br.connect("clicked",self._reset_all); tb2.pack_start(br,False,False,0)
 
         tb2.pack_start(_sep(),False,False,6)
         bcp=Gtk.Button(label="🎛 Chaos Pad")
         bcp.connect("clicked",self._open_chaos_pad)
         tb2.pack_start(bcp,False,False,0)
-        self._chaos_pad_win=None
 
-        # ── pasek 3: transformacje ────────────────────────────────
+        # Store info label
+        self.store_lbl = Gtk.Label(label="")
+        self.store_lbl.set_xalign(0)
+        tb2.pack_start(self.store_lbl, False,False,8)
+
+        # ── pasek 3: transformacje CP ─────────────────────────────
         tb3=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=4)
         tb3.set_border_width(2); root.pack_start(tb3,False,False,0)
-        tb3.pack_start(Gtk.Label(label="Zaznaczenie:"),False,False,0)
-        for lbl,act in [("Ścisn.Y",'compress_y'),("Rozciąg.Y",'stretch_y'),
-                        ("Ścisn.X",'compress_x'),("Rozciąg.X",'stretch_x'),
-                        ("Odwróć Y",'flip_y'),("Odwróć X",'flip_x'),
-                        ("Wł/Wył",'toggle'),("Usuń",'delete')]:
+        tb3.pack_start(Gtk.Label(label="Zaznaczone CP:"),False,False,0)
+        # Uproszczone ikony dla transformacji
+        for lbl,act,tip in [("▼Y",'compress_y',"Ściskaj Y"),
+                             ("▲Y",'stretch_y', "Rozciągaj Y"),
+                             ("◄X",'compress_x',"Ściskaj X"),
+                             ("►X",'stretch_x', "Rozciągaj X"),
+                             ("⇅", 'flip_y',    "Odwróć Y"),
+                             ("⇄", 'flip_x',    "Odwróć X"),
+                             ("●∘",'toggle',    "Wł/Wył warstwę"),
+                             ("✕", 'delete',    "Usuń warstwę")]:
             b=Gtk.Button(label=lbl)
+            b.set_tooltip_text(tip)
             b.connect("clicked",lambda w,a=act:self._transform_sel(a))
             tb3.pack_start(b,False,False,0)
         tb3.pack_start(Gtk.Label(label=" sY:"),False,False,0)
         self.sel_sy=Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
         self.sel_sy.set_range(0.05,4.0); self.sel_sy.set_value(1.0)
-        self.sel_sy.set_digits(2); self.sel_sy.set_size_request(100,-1)
+        self.sel_sy.set_digits(2); self.sel_sy.set_size_request(80,-1)
         tb3.pack_start(self.sel_sy,False,False,0)
         tb3.pack_start(Gtk.Label(label=" sX:"),False,False,0)
         self.sel_sx=Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
         self.sel_sx.set_range(0.05,4.0); self.sel_sx.set_value(1.0)
-        self.sel_sx.set_digits(2); self.sel_sx.set_size_request(100,-1)
+        self.sel_sx.set_digits(2); self.sel_sx.set_size_request(80,-1)
         tb3.pack_start(self.sel_sx,False,False,0)
 
         # ── drawing area ──────────────────────────────────────────
         hb=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         root.pack_start(hb,True,True,0)
-        self.drawing_area=Gtk.DrawingArea(); self.drawing_area.set_size_request(1280,420)
+        self.drawing_area=Gtk.DrawingArea()
+        self.drawing_area.set_size_request(1280,400)
         self.drawing_area.connect("draw",self.on_draw)
         self.drawing_area.connect("button-press-event",  self.on_press)
         self.drawing_area.connect("button-release-event",self.on_release)
         self.drawing_area.connect("motion-notify-event", self.on_motion)
         mask=(Gdk.EventMask.BUTTON_PRESS_MASK|Gdk.EventMask.BUTTON_RELEASE_MASK|
               Gdk.EventMask.POINTER_MOTION_MASK)
-        self.drawing_area.set_events(mask); hb.pack_start(self.drawing_area,True,True,0)
+        self.drawing_area.set_events(mask)
+        hb.pack_start(self.drawing_area,True,True,0)
         self.vscroll=Gtk.VScrollbar(); self.vscroll.connect("value-changed",self._on_scroll)
         hb.pack_start(self.vscroll,False,False,0)
 
         # ── velocity ──────────────────────────────────────────────
-        vf=Gtk.Frame(label=" Velocity (LPM=węzeł, PPM=usuń, naciągnij ↑↓) ")
+        vf=Gtk.Frame(label=" Velocity (LPM=węzeł, PPM=usuń) ")
         vf.set_border_width(2); root.pack_start(vf,False,False,0)
         vvb=Gtk.Box(orientation=Gtk.Orientation.VERTICAL); vf.add(vvb)
         vtb=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
         vtb.set_border_width(2); vvb.pack_start(vtb,False,False,0)
-        vchk=Gtk.CheckButton(label="Stosuj velocity"); vchk.set_active(True)
+        vchk=Gtk.CheckButton(label="Velocity"); vchk.set_active(True)
         vchk.connect("toggled",lambda w:[setattr(self,'vel_apply',w.get_active()),self._rerender()])
         vtb.pack_start(vchk,False,False,0)
         vrst=Gtk.Button(label="Reset 100%"); vrst.connect("clicked",self._vel_reset)
         vtb.pack_start(vrst,False,False,0)
-        self.vel_area=Gtk.DrawingArea(); self.vel_area.set_size_request(-1,70)
+        self.vel_area=Gtk.DrawingArea(); self.vel_area.set_size_request(-1,65)
         self.vel_area.connect("draw",self._vel_draw)
         self.vel_area.connect("button-press-event",  self._vel_press)
         self.vel_area.connect("button-release-event",self._vel_release)
         self.vel_area.connect("motion-notify-event", self._vel_motion)
         self.vel_area.set_events(mask); vvb.pack_start(self.vel_area,True,True,0)
 
-
         # ── strefy loopowania ─────────────────────────────────────
-        zf = Gtk.Frame(label=" Strefy loopowania (LPM=nowa strefa | PPM=usuń | drag=przesuń granicę) ")
+        zf = Gtk.Frame(label=" Strefy loopowania (LPM=nowa, PPM=usuń, drag=granica) ")
         zf.set_border_width(2); root.pack_start(zf, False, False, 0)
         zvb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); zf.add(zvb)
 
-        # pasek kontrolny stref
         ztb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         ztb.set_border_width(2); zvb.pack_start(ztb, False, False, 0)
 
@@ -544,37 +859,65 @@ class WaveformEditor(Gtk.Window):
         self.zone_mode_combo.connect("changed", lambda w: setattr(self,'zone_mode',w.get_active_text()))
         ztb.pack_start(self.zone_mode_combo, False, False, 0)
 
-        for lbl,cb in [("▶ Play stref", self._zone_play),
-                       ("⏹ Stop",       self._zone_stop),
-                       ("📋 → Fala",    self._zone_render_to_wave),
-                       ("🗑 Wyczyść",   self._zone_clear)]:
-            b=Gtk.Button(label=lbl); b.connect("clicked",cb); ztb.pack_start(b,False,False,0)
+        # Typ przenikania — NOWE
+        ztb.pack_start(Gtk.Label(label=" Przenikanie:"), False, False, 0)
+        self.xfade_combo = Gtk.ComboBoxText()
+        self.xfade_combo.append_text("ostre")
+        self.xfade_combo.append_text("zachodzące")
+        self.xfade_combo.set_active(0)
+        self.xfade_combo.set_tooltip_text("Typ przejścia między sekcjami stref")
+        self.xfade_combo.connect("changed", self._xfade_changed)
+        ztb.pack_start(self.xfade_combo, False, False, 0)
 
-        ztb.pack_start(Gtk.Label(label="  Zaznaczona strefa:"), False, False, 0)
+        for lbl,cb in [("▶ Play", self._zone_play),
+                       ("⏹ Stop", self._zone_stop),
+                       ("📋→Fala",self._zone_render_to_wave),
+                       ("🗑",     self._zone_clear)]:
+            b=Gtk.Button(label=lbl); b.connect("clicked",cb)
+            ztb.pack_start(b,False,False,0)
+
+        ztb.pack_start(Gtk.Label(label="  Z zaznaczona:"), False, False, 0)
         self.zone_repeats_spin = Gtk.SpinButton()
         self.zone_repeats_spin.set_range(1,32); self.zone_repeats_spin.set_value(1)
         self.zone_repeats_spin.set_increments(1,4)
         self.zone_repeats_spin.connect("value-changed", self._zone_repeats_changed)
-        ztb.pack_start(Gtk.Label(label="Powtórzeń:"), False, False, 0)
+        ztb.pack_start(Gtk.Label(label="×"), False, False, 0)
         ztb.pack_start(self.zone_repeats_spin, False, False, 0)
 
         b_add_pass = Gtk.Button(label="+ Przebieg")
         b_add_pass.connect("clicked", self._zone_add_pass)
         ztb.pack_start(b_add_pass, False, False, 0)
-        b_del_pass = Gtk.Button(label="- Przebieg")
+        b_del_pass = Gtk.Button(label="− Przebieg")
         b_del_pass.connect("clicked", self._zone_del_pass)
         ztb.pack_start(b_del_pass, False, False, 0)
 
-        # obszar stref (DrawingArea)
+        # Obszar stref
         self.zone_area = Gtk.DrawingArea()
         self.zone_area.set_size_request(-1, 90)
         self.zone_area.connect("draw", self._zone_draw)
         self.zone_area.connect("button-press-event",   self._zone_press)
         self.zone_area.connect("button-release-event", self._zone_release)
         self.zone_area.connect("motion-notify-event",  self._zone_motion)
-        self.zone_area.set_events(mask); zvb.pack_start(self.zone_area, False, False, 0)
+        self.zone_area.set_events(mask)
+        zvb.pack_start(self.zone_area, False, False, 0)
 
-        # panel edycji przebiegów zaznaczonej strefy
+        # ── Suwak End-to (nowy!) ──────────────────────────────────
+        etb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        etb.set_border_width(3)
+        zvb.pack_start(etb, False, False, 0)
+        etb.pack_start(Gtk.Label(label="End to:"), False, False, 0)
+        self.end_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
+        self.end_scale.set_range(0.05, 1.0); self.end_scale.set_value(1.0)
+        self.end_scale.set_digits(2)
+        self.end_scale.set_hexpand(True)
+        self.end_scale.set_draw_value(True)
+        self.end_scale.connect("value-changed", self._end_scale_changed)
+        etb.pack_start(self.end_scale, True, True, 0)
+        self.end_lbl = Gtk.Label(label="100%")
+        self.end_lbl.set_width_chars(6)
+        etb.pack_start(self.end_lbl, False, False, 0)
+
+        # Panel przebiegów
         self.pass_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.pass_box.set_border_width(2)
         zvb.pack_start(self.pass_box, False, False, 0)
@@ -594,22 +937,159 @@ class WaveformEditor(Gtk.Window):
         # ── status ────────────────────────────────────────────────
         self.status=Gtk.Label(label="Gotowy — wygeneruj falę lub wczytaj WAV")
         self.status.set_xalign(0); self.status.set_margin_start(4)
-        self.status.set_margin_top(2); self.status.set_margin_bottom(2)
         root.pack_start(self.status,False,False,0)
+
+    # ══════════════════════════════════════════════════════════════
+    #  End-to suwak
+    # ══════════════════════════════════════════════════════════════
+    def _end_scale_changed(self, widget):
+        self.play_end_frac = widget.get_value()
+        pct = int(self.play_end_frac * 100)
+        self.end_lbl.set_text(f"{pct}%")
+        self.zone_area.queue_draw()
+
+    def _wave_trimmed(self) -> np.ndarray:
+        """Zwraca finalną falę (non-destructive render) obciętą do play_end_frac."""
+        wave = self._build_render_wave()
+        if len(wave) < 2:
+            return wave
+        end = max(2, int(len(wave) * self.play_end_frac))
+        return wave[:end]
+
+    # ══════════════════════════════════════════════════════════════
+    #  Crossfade wybór
+    # ══════════════════════════════════════════════════════════════
+    def _xfade_changed(self, combo):
+        mapping = {"ostre": "sharp", "zachodzące": "crossfade"}
+        self.zone_crossfade = mapping.get(combo.get_active_text(), "sharp")
+
+    # ══════════════════════════════════════════════════════════════
+    #  MIDI callbacks
+    # ══════════════════════════════════════════════════════════════
+    def _midi_note_on(self, note, velocity):
+        self._midi_playing_note = note
+        vel_norm = velocity / 127.0
+        GLib.idle_add(self._midi_update_ui)
+        # Play waveform at this note pitch shifted
+        if len(self.waveform) > 1 and PYGAME_OK:
+            wave = self._wave_trimmed()
+            # pitch-shift via resample ratio
+            base_note = 69  # A4=440Hz
+            ratio = 2.0 ** ((note - base_note) / 12.0)
+            # velocity scaling
+            wave_out = wave * vel_norm
+            # apply pitch by resampling
+            n_new = max(2, int(len(wave_out) / ratio))
+            wave_pitched = np.interp(
+                np.linspace(0, len(wave_out)-1, n_new),
+                np.arange(len(wave_out)),
+                wave_out
+            )
+            self._play_wave(wave_pitched)
+
+    def _midi_note_off(self, note):
+        if self._midi_playing_note == note:
+            self._midi_playing_note = None
+            if not self._midi_sustain:
+                GLib.idle_add(self._do_midi_stop)
+        GLib.idle_add(self._midi_update_ui)
+
+    def _do_midi_stop(self):
+        if PYGAME_OK and not self._midi_sustain and self._midi_playing_note is None:
+            pygame.mixer.music.stop()
+
+    def _midi_pitchbend(self, value):
+        self._midi_pitch_bend = value
+        GLib.idle_add(self._midi_update_ui)
+
+    def _midi_cc(self, cc, val):
+        norm = val / 127.0
+        if cc == 1:     # Modulation wheel
+            self._midi_modulation = norm
+        elif cc == 7:   # Volume
+            self._midi_volume = norm
+        elif cc == 64:  # Sustain pedal
+            self._midi_sustain = val >= 64
+            if not self._midi_sustain and self._midi_playing_note is None:
+                GLib.idle_add(self._do_midi_stop)
+        GLib.idle_add(self._midi_update_ui)
+
+    def _midi_update_ui(self):
+        self.midi_pb_lbl.set_text(f"PB:{self._midi_pitch_bend:+.2f}")
+        self.midi_mod_lbl.set_text(f"MOD:{self._midi_modulation:.2f}")
+        note = self._midi_playing_note
+        if note is not None:
+            names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+            nm = names[note % 12] + str(note // 12 - 1)
+            self.midi_note_lbl.set_text(f"♪ {nm}")
+        else:
+            self.midi_note_lbl.set_text("NOTE:---")
+
+    def _open_midi_dialog(self, widget=None):
+        ports = self.midi.list_ports()
+        dlg = MIDIDeviceDialog(self, ports)
+        resp = dlg.run()
+        if resp == Gtk.ResponseType.OK and dlg.selected_idx >= 0:
+            if self.midi.open(dlg.selected_idx):
+                port_name = ports[dlg.selected_idx] if ports else "?"
+                self.midi_status_lbl.set_markup(
+                    f'<span foreground="lime">⬤ {port_name[:18]}</span>')
+                self._st(f"MIDI: {port_name}")
+            else:
+                self.midi_status_lbl.set_markup('<span foreground="red">⬤ BŁĄD</span>')
+        dlg.destroy()
 
     # ══════════════════════════════════════════════════════════════
     #  Callbacki narzędzi
     # ══════════════════════════════════════════════════════════════
     def _on_tool(self,btn,t):
-        if btn.get_active(): self.current_tool=t
+        if btn.get_active():
+            self.current_tool=t
+            # czyść zaznaczenie CP przy zmianie narzędzia
+            if t != TOOL_SELECT:
+                self.sel_cp_set.clear()
+                self.drawing_area.queue_draw()
+
     def _on_linetype(self,btn,lt):
         if btn.get_active():
             self.current_line=lt
             for l in self.layers:
                 if l.selected: l.line_type=lt
             self.drawing_area.queue_draw()
+
     def _on_corrmode(self,btn,cm):
         if btn.get_active(): self.current_corr=cm
+
+    # ══════════════════════════════════════════════════════════════
+    #  SampleStore — JSON
+    # ══════════════════════════════════════════════════════════════
+    def _update_store(self, source="editor", extra=None):
+        extra = extra or {}
+        self.store.update_from_wave(
+            self.original_wave, self.wave_cps,
+            source=source, sr=self.sample_rate,
+            duration=extra.pop("duration", len(self.original_wave)/max(self.sample_rate,1)),
+            wtype=extra.pop("wtype", self.gen_combo.get_active_text() or "custom"),
+            **extra
+        )
+        self.store.update_zones(self.zones)
+        self.store.update_vel(self.vel_nodes)
+        self.store_lbl.set_text(self.store.summary())
+
+    def _save_json(self, widget=None):
+        dlg=Gtk.FileChooserDialog(title="Zapisz próbkę JSON",parent=self,
+                                  action=Gtk.FileChooserAction.SAVE)
+        dlg.add_buttons(Gtk.STOCK_CANCEL,Gtk.ResponseType.CANCEL,
+                        Gtk.STOCK_SAVE,  Gtk.ResponseType.OK)
+        filt=Gtk.FileFilter(); filt.set_name("JSON (*.json)"); filt.add_pattern("*.json")
+        dlg.add_filter(filt)
+        if dlg.run()==Gtk.ResponseType.OK:
+            path=dlg.get_filename()
+            if not path.endswith(".json"): path+=".json"
+            self._update_store()
+            self.store.save(path)
+            self._st(f"Zapisano JSON: {path}")
+        dlg.destroy()
 
     # ══════════════════════════════════════════════════════════════
     #  Generator
@@ -618,16 +1098,19 @@ class WaveformEditor(Gtk.Window):
         wtype = self.gen_combo.get_active_text() or "sine"
         dur   = self.gen_dur.get_value()
         wave  = generate_base_wave(wtype, dur, self.sample_rate)
-        self._set_wave(wave)
+        self._set_wave(wave, source="generator", wtype=wtype, duration=dur)
         self._st(f"Wygenerowano: {wtype}  {dur:.2f}s  {len(wave)} próbek  CP={len(self.wave_cps)}")
 
-    def _set_wave(self, wave):
+    def _set_wave(self, wave, source="editor", **kwargs):
         self.original_wave = wave.copy()
+        self.post_dsp_name = None          # nowa fala — reset post-DSP
         self.wave_cps      = extract_control_points(wave)
         self.layers        = []
+        self.sel_cp_set    = set()
         self.view_start    = 0; self.view_end = len(wave)
         self._rerender(); self._update_view()
         self.drawing_area.queue_draw(); self.vel_area.queue_draw()
+        self._update_store(source=source, extra=kwargs)
 
     # ══════════════════════════════════════════════════════════════
     #  Profile
@@ -646,27 +1129,26 @@ class WaveformEditor(Gtk.Window):
         new_wave=reconstruct_wave(cps, len(self.original_wave))
         new_wave=SoundProfile.apply_dsp(name, new_wave, self.sample_rate)
         new_wave=_normalize(new_wave)
-        # pre modyfikuje oryginał → nowe CP
         self.original_wave=new_wave
         self.wave_cps=extract_control_points(new_wave)
         self._rerender(); self.drawing_area.queue_draw()
+        self._update_store(source="pre_profile", extra={"pre_profile": name})
         self._st(f"Pre-profil: {name}  CP={len(self.wave_cps)}")
 
     def _apply_post(self, widget):
         name=self._pname(self.post_combo)
-        if not name or len(self.waveform)<2: return
-        w=SoundProfile.apply_dsp(name, self.waveform.copy(), self.sample_rate)
-        self.waveform=_normalize(w)
+        if not name or len(self.original_wave)<2: return
+        self.post_dsp_name = name   # non-destructive: aplikowane przy każdym render
         self.drawing_area.queue_draw()
         if self.live_play: self._play_now()
-        self._st(f"Post DSP: {name}")
+        self._st(f"Post DSP: {name}  (non-destructive)")
 
     def _open_chaos_pad(self, widget=None):
         if not CHAOS_PAD_OK:
             dlg=Gtk.MessageDialog(parent=self,flags=0,
                 message_type=Gtk.MessageType.ERROR,
                 buttons=Gtk.ButtonsType.OK,
-                text="Brak pliku chaos_pad.py w tym samym katalogu co ED_Waves_v3.py")
+                text="Brak pliku chaos_pad.py w tym samym katalogu co ED_Waves.py")
             dlg.run(); dlg.destroy(); return
         if self._chaos_pad_win is None or not self._chaos_pad_win.get_visible():
             self._chaos_pad_win = _ChaosPadWindow(callback=self._chaos_pad_callback)
@@ -675,27 +1157,42 @@ class WaveformEditor(Gtk.Window):
             self._chaos_pad_win.present()
 
     def _chaos_pad_callback(self, wave, params):
-        """Odbiera falę z Chaos Pada i ustawia ją jako nową bazową falę."""
+        """Odbiera falę z Chaos Pada + zapisuje parametry w SampleStore."""
         if wave is None or len(wave) < 4:
             return
-        # normalizacja
         mx = np.max(np.abs(wave))
         if mx > 1e-9: wave = wave / mx
         self.original_wave = wave.copy()
+        self.base_wave     = wave.copy()   # czyste źródło bez CP-interpolacji
+        self.waveform      = wave.copy()   # widok (do rysowania)
+        self.post_dsp_name = None          # reset post-DSP przy nowej fali
         self.wave_cps      = extract_control_points(wave)
         self.layers        = []
+        self.sel_cp_set    = set()
         self.view_start    = 0; self.view_end = len(wave)
-        self._rerender(); self._update_view()
+        self._update_view()
         GLib.idle_add(self.drawing_area.queue_draw)
         GLib.idle_add(self.vel_area.queue_draw)
         f0   = params.get('f0', 0)
         poly = params.get('poly', 1)
-        self._st(f"Chaos Pad → fala odebrana  f0={f0:.1f}Hz  poly={poly:.1f}  CP={len(self.wave_cps)}")
+        # Zapisz parametry ChaosPad w SampleStore — gwarantuje stabilność brzmienia
+        self._update_store(
+            source="chaos_pad",
+            extra={
+                "wtype": "chaos_pad",
+                "duration": len(wave)/self.sample_rate,
+                "params": {k: (v if not isinstance(v, (list,np.ndarray))
+                               else [float(x) for x in v])
+                           for k,v in params.items()},
+            }
+        )
+        self._st(f"Chaos Pad → f0={f0:.1f}Hz  poly={poly:.1f}  CP={len(self.wave_cps)}")
 
     def _reset_all(self, widget):
         self.wave_cps=extract_control_points(self.original_wave)
-        self.layers=[]; self._rerender()
-        self.drawing_area.queue_draw()
+        self.layers=[]; self.sel_cp_set=set()
+        self._rerender(); self.drawing_area.queue_draw()
+        self._update_store(source="reset")
         self._st("Reset — oryginalna fala + CP odtworzone")
 
     # ══════════════════════════════════════════════════════════════
@@ -711,10 +1208,35 @@ class WaveformEditor(Gtk.Window):
                 layer.apply_to_cps(cps, ox, oy, cw, ch, n)
         wave=reconstruct_wave(cps, n)
         wave=_normalize(wave) if np.max(np.abs(wave))>1e-9 else wave
-        if self.vel_apply:
-            wave=wave*self._vel_curve(n)
+        # base_wave = CP-rekonstrukcja bez vel i post-DSP (czyste źródło)
+        self.base_wave = wave
+        # waveform = base_wave (do rysowania — bez time-warp żeby nie zmieniać długości widoku)
         self.waveform=wave
         if self.live_play: self._play_now()
+        # Uaktualnij CP w store
+        self.store.update_cps(cps)
+
+    def _build_render_wave(self):
+        """Buduje falę do odtwarzania non-destructive:
+        original_wave → CP layers → base_wave → vel_curve → post_dsp
+        Nigdy nie mutuje żadnego pola stanu."""
+        if len(self.original_wave) < 2:
+            return self.original_wave.copy()
+        # Użyj base_wave jeśli dostępne (obliczone przez _rerender),
+        # wpp. zrekonstruuj bezpośrednio z original_wave
+        if hasattr(self, 'base_wave') and len(self.base_wave) == len(self.original_wave):
+            wave = self.base_wave.copy()
+        else:
+            wave = self.waveform.copy() if len(self.waveform) > 1 else self.original_wave.copy()
+        # Aplikuj krzywą prędkości (time-warp)
+        if self.vel_apply:
+            wave = self._apply_speed_warp(wave)
+        # Aplikuj post-DSP (bez mutowania waveform)
+        if self.post_dsp_name:
+            wave = SoundProfile.apply_dsp(self.post_dsp_name, wave, self.sample_rate)
+            mx = np.max(np.abs(wave))
+            if mx > 1e-9: wave = wave / mx
+        return wave
 
     # ══════════════════════════════════════════════════════════════
     #  on_draw
@@ -726,22 +1248,38 @@ class WaveformEditor(Gtk.Window):
         self._draw_freq_axis(cr,oy,ch)
         self._draw_ruler(cr,ox,oy,cw)
         self._draw_grid(cr,ox,oy,cw,ch)
+        # oś środkowa
         cr.set_source_rgba(0.5,0.5,0.5,0.6); cr.set_line_width(1)
         cr.move_to(ox,oy+ch/2); cr.line_to(ox+cw,oy+ch/2); cr.stroke()
+        # waveform
         if len(self.waveform)>1: self._draw_wave(cr,ox,oy,cw,ch)
-        if self.show_cps and self.wave_cps: self._draw_wave_cps(cr,ox,oy,cw,ch)
+        # CP — zaznaczone/niezaznaczone
+        if self.show_cps and self.wave_cps:
+            self._draw_wave_cps(cr,ox,oy,cw,ch)
+        # Warstwy korekcji
         for layer in self.layers: layer.draw(cr)
+        # Podgląd rysowania nowej warstwy
         if self.draw_start and self.current_tool==TOOL_DRAW:
             cr.set_source_rgba(0.3,0.9,1.0,0.45); cr.set_line_width(1.5); cr.set_dash([6,4])
             cr.move_to(*self.draw_start); cr.line_to(*self.mouse_pos); cr.stroke()
             cr.set_dash([]); cr.set_source_rgba(0.3,0.9,1.0,0.85)
             cr.arc(self.draw_start[0],self.draw_start[1],CP_R+1,0,6.28); cr.fill()
+        # Prostokąt zaznaczenia
         if self.sel_rect_s and self.sel_rect_e:
             x1,y1=self.sel_rect_s; x2,y2=self.sel_rect_e
             rx,ry=min(x1,x2),min(y1,y2); rw,rh=abs(x2-x1),abs(y2-y1)
             cr.set_source_rgba(0.3,0.75,1.0,0.12); cr.rectangle(rx,ry,rw,rh); cr.fill()
-            cr.set_source_rgba(0.3,0.75,1.0,0.75); cr.set_line_width(1)
-            cr.rectangle(rx,ry,rw,rh); cr.stroke()
+            cr.set_source_rgba(0.3,0.75,1.0,0.75); cr.set_line_width(1.5); cr.set_dash([4,3])
+            cr.rectangle(rx,ry,rw,rh); cr.stroke(); cr.set_dash([])
+        # End-to marker
+        if len(self.waveform)>1:
+            end_x = ox + self.play_end_frac * cw
+            cr.set_source_rgba(1.0, 0.3, 0.3, 0.8)
+            cr.set_line_width(1.5); cr.set_dash([5,3])
+            cr.move_to(end_x, oy); cr.line_to(end_x, oy+ch); cr.stroke()
+            cr.set_dash([])
+            cr.set_font_size(8); cr.move_to(end_x+2, oy+10)
+            cr.show_text(f"END {int(self.play_end_frac*100)}%")
 
     def _draw_wave(self, cr, ox, oy, cw, ch):
         cr.set_source_rgba(0.20,0.72,0.32,0.85); cr.set_line_width(1.2)
@@ -757,14 +1295,23 @@ class WaveformEditor(Gtk.Window):
         cr.stroke()
 
     def _draw_wave_cps(self, cr, ox, oy, cw, ch):
+        """Rysuje CP — zaznaczone świecą na biało/żółto, niezaznaczone pomarańczowo."""
         n=len(self.original_wave); vlen=max(1,self.view_end-self.view_start)
-        for cp in self.wave_cps:
+        for i, cp in enumerate(self.wave_cps):
             idx,amp=cp[0],cp[1]
             t_view=(idx-self.view_start)/vlen
             if t_view<-0.01 or t_view>1.01: continue
             x=ox+t_view*cw; y=oy+ch/2-amp*ch/2
-            cr.set_source_rgba(0.9,0.5,0.1,0.75)
-            cr.arc(x,y,3,0,6.28); cr.fill()
+            is_sel = i in self.sel_cp_set
+            if is_sel:
+                cr.set_source_rgba(1.0, 0.92, 0.15, 0.95)
+                cr.arc(x, y, 5, 0, 6.28); cr.fill()
+                cr.set_source_rgba(1,1,1,0.8)
+                cr.arc(x, y, 5, 0, 6.28)
+                cr.set_line_width(1.5); cr.stroke()
+            else:
+                cr.set_source_rgba(0.9, 0.5, 0.1, 0.70)
+                cr.arc(x, y, 3, 0, 6.28); cr.fill()
 
     def _draw_freq_axis(self, cr, oy, ch):
         cr.set_font_size(9)
@@ -795,7 +1342,7 @@ class WaveformEditor(Gtk.Window):
             x=ox+i*cw/8; cr.move_to(x,oy); cr.line_to(x,oy+ch); cr.stroke()
 
     # ══════════════════════════════════════════════════════════════
-    #  Mysz
+    #  Mysz — edytor
     # ══════════════════════════════════════════════════════════════
     def on_press(self, widget, event):
         x,y=event.x,event.y
@@ -816,16 +1363,19 @@ class WaveformEditor(Gtk.Window):
     def on_motion(self, widget, event):
         x,y=event.x,event.y; self.mouse_pos=(x,y)
         if self.current_tool==TOOL_EDIT and self.drag_target: self._edit_move(x,y)
-        elif self.current_tool==TOOL_SELECT and self.sel_rect_s: self.sel_rect_e=(x,y)
+        elif self.current_tool==TOOL_SELECT and self.sel_rect_s:
+            self.sel_rect_e=(x,y)
+            # Bieżące zaznaczenie CP (live preview)
+            self._update_cp_selection_from_rect(x,y)
         self.drawing_area.queue_draw()
         ox,oy,cw,ch=self._crect()
         t=(x-ox)/max(cw,1); a=(oy+ch/2-y)/max(ch/2,1)
         if len(self.waveform)>0:
             vlen=max(1,self.view_end-self.view_start)
             idx=int(self.view_start+t*vlen); ms=max(idx,0)/self.sample_rate*1000
-            self._st(f"t={ms:.1f}ms  amp={a:.3f}  CP={len(self.wave_cps)}  "
-                     f"warstwy={len(self.layers)}  narz={self.current_tool}  "
-                     f"tryb={self.current_corr}")
+            nsel=len(self.sel_cp_set)
+            self._st(f"t={ms:.1f}ms  amp={a:.3f}  CP={len(self.wave_cps)} "
+                     f"(zaznaczone:{nsel})  warstwy={len(self.layers)}")
 
     def _draw_release(self, x, y):
         if self.draw_start is None: return
@@ -855,24 +1405,49 @@ class WaveformEditor(Gtk.Window):
         if attr=="p1": l.cp1[0]+=dx; l.cp1[1]+=dy
 
     def _sel_press(self, x, y, event):
-        if event.state&Gdk.ModifierType.CONTROL_MASK:
+        if event.state & Gdk.ModifierType.CONTROL_MASK:
+            # Ctrl+klik: toggle warstwy
             l=self._layer_at(x,y)
             if l: l.selected=not l.selected
         else:
+            # Czyść zaznaczenie warstw i CP
             for l in self.layers: l.selected=False
+            self.sel_cp_set.clear()
             self.sel_rect_s=(x,y); self.sel_rect_e=(x,y)
         self.drawing_area.queue_draw()
 
+    def _update_cp_selection_from_rect(self, x2, y2):
+        """Zaznacza CP wewnątrz prostokąta sel_rect_s / (x2,y2)."""
+        if not self.sel_rect_s:
+            return
+        x1, y1 = self.sel_rect_s
+        rx0, rx1 = min(x1,x2), max(x1,x2)
+        ry0, ry1 = min(y1,y2), max(y1,y2)
+        ox, oy, cw, ch = self._crect()
+        vlen = max(1, self.view_end - self.view_start)
+        self.sel_cp_set.clear()
+        for i, cp in enumerate(self.wave_cps):
+            idx, amp = cp[0], cp[1]
+            t_view = (idx - self.view_start) / vlen
+            px = ox + t_view * cw
+            py = oy + ch/2 - amp * ch/2
+            if rx0 <= px <= rx1 and ry0 <= py <= ry1:
+                self.sel_cp_set.add(i)
+
     def _sel_release(self, x, y):
         if self.sel_rect_s:
+            self._update_cp_selection_from_rect(x, y)
+            # Zaznacz też warstwy korekcji wewnątrz prostokąta
             x1,y1=self.sel_rect_s
             rx0,rx1=min(x1,x),max(x1,x); ry0,ry1=min(y1,y),max(y1,y)
             for l in self.layers:
-                px,py=l.p0
-                if rx0<=px<=rx1 and ry0<=py<=ry1: l.selected=True
-                px,py=l.p1
-                if rx0<=px<=rx1 and ry0<=py<=ry1: l.selected=True
+                for px,py in [l.p0, l.p1]:
+                    if rx0<=px<=rx1 and ry0<=py<=ry1:
+                        l.selected=True
             self.sel_rect_s=None; self.sel_rect_e=None
+        nsel=len(self.sel_cp_set)
+        if nsel > 0:
+            self._st(f"Zaznaczono {nsel} punktów CP")
 
     def _layer_at(self, x, y, thresh=14):
         for l in reversed(self.layers):
@@ -881,8 +1456,9 @@ class WaveformEditor(Gtk.Window):
         return None
 
     def _transform_sel(self, action):
+        """Transformacja zaznaczonych warstw korekcji."""
         sel=[l for l in self.layers if l.selected]
-        if not sel: self._st("Brak zaznaczonych!"); return
+        if not sel: self._st("Brak zaznaczonych warstw!"); return
         sy=self.sel_sy.get_value(); sx=self.sel_sx.get_value()
         xs=[c for l in sel for c in [l.p0[0],l.p1[0]]]
         ys=[c for l in sel for c in [l.p0[1],l.p1[1]]]
@@ -904,23 +1480,23 @@ class WaveformEditor(Gtk.Window):
     def _ctx_menu(self, x, y, event):
         l=self._layer_at(x,y); menu=Gtk.Menu()
         if l:
-            for lbl,lt in [("Bézier",LINE_BEZIER),("Liniowy",LINE_LINEAR),("Schodek",LINE_STEP)]:
-                item=Gtk.MenuItem(label=f"→ {lbl}")
+            for lbl,lt in [("~ Bézier",LINE_BEZIER),("∕ Liniowy",LINE_LINEAR),("⌐ Schodek",LINE_STEP)]:
+                item=Gtk.MenuItem(label=lbl)
                 item.connect("activate",lambda w,s=l,t=lt:[setattr(s,'line_type',t),
                              self.drawing_area.queue_draw(),self._rerender()])
                 menu.append(item)
-            for lbl,cm in [("MUL ×",CORR_MUL),("ADD ±",CORR_ADD)]:
-                item=Gtk.MenuItem(label=f"Tryb: {lbl}")
+            for lbl,cm in [("× MUL",CORR_MUL),("± ADD",CORR_ADD)]:
+                item=Gtk.MenuItem(label=lbl)
                 item.connect("activate",lambda w,s=l,c=cm:[setattr(s,'mode',c),
                              self.drawing_area.queue_draw(),self._rerender()])
                 menu.append(item)
             menu.append(Gtk.SeparatorMenuItem())
-            item=Gtk.MenuItem(label="Usuń warstwę")
+            item=Gtk.MenuItem(label="✕ Usuń warstwę")
             item.connect("activate",lambda w,s=l:[self.layers.remove(s) if s in self.layers else None,
                          self.drawing_area.queue_draw(),self._rerender()])
             menu.append(item)
         else:
-            item=Gtk.MenuItem(label="Wyczyść warstwy")
+            item=Gtk.MenuItem(label="🗑 Wyczyść warstwy")
             item.connect("activate",self._clear_layers)
             menu.append(item)
         menu.show_all(); menu.popup_at_pointer(event)
@@ -938,49 +1514,48 @@ class WaveformEditor(Gtk.Window):
         ox=self.VEL_PL; return ox,4,w-ox-self.VEL_PR,h-8
 
     def _vt2x(self,t): ox,oy,cw,ch=self._vrect(); return ox+t*cw
-    def _vv2y(self,v): ox,oy,cw,ch=self._vrect(); return oy+(1-v)*ch
+    def _vv2y(self,v):
+        ox,oy,cw,ch=self._vrect()
+        # v w zakresie 0.25..4.0, log-skala, 1.0 = środek
+        lo,hi=math.log(0.25),math.log(4.0)
+        return oy+ch*(1-(math.log(max(v,0.01))-lo)/(hi-lo))
     def _vx2t(self,x): ox,oy,cw,ch=self._vrect(); return max(0.,min(1.,(x-ox)/max(cw,1)))
-    def _vy2v(self,y): ox,oy,cw,ch=self._vrect(); return max(0.,min(1.,1.-(y-oy)/max(ch,1)))
-
+    def _vy2v(self,y):
+        ox,oy,cw,ch=self._vrect()
+        lo,hi=math.log(0.25),math.log(4.0)
+        lv=lo+(hi-lo)*(1-(y-oy)/max(ch,1))
+        return max(0.25,min(4.0,math.exp(lv)))
 
     # ══════════════════════════════════════════════════════════════
     #  Kolory stref
     # ══════════════════════════════════════════════════════════════
     ZONE_COLORS = [
-        (0.90, 0.35, 0.15),  # pomarańcz
-        (0.20, 0.70, 0.90),  # błękit
-        (0.30, 0.85, 0.40),  # zieleń
-        (0.85, 0.20, 0.70),  # róż
-        (0.90, 0.85, 0.15),  # żółty
-        (0.55, 0.30, 0.95),  # fiolet
-        (0.15, 0.80, 0.70),  # turkus
-        (0.95, 0.55, 0.20),  # złoty
+        (0.90, 0.35, 0.15), (0.20, 0.70, 0.90), (0.30, 0.85, 0.40),
+        (0.85, 0.20, 0.70), (0.90, 0.85, 0.15), (0.55, 0.30, 0.95),
+        (0.15, 0.80, 0.70), (0.95, 0.55, 0.20),
     ]
 
-    # Typy przebiegów i ich opisy
     PASS_MODES = [
-        ("fwd",            "→ cały"),
-        ("rev",            "← cały"),
-        ("fwd_half_start", "→½ pocz"),
-        ("fwd_half_end",   "→½ kon"),
-        ("rev_half_start", "←½ pocz"),
-        ("rev_half_end",   "←½ kon"),
-        ("pingpong",       "↔ ping"),
-        ("custom",         "✎ zakres"),
+        ("fwd",            "→"),
+        ("rev",            "←"),
+        ("fwd_half_start", "→½s"),
+        ("fwd_half_end",   "→½e"),
+        ("rev_half_start", "←½s"),
+        ("rev_half_end",   "←½e"),
+        ("pingpong",       "↔"),
+        ("custom",         "✎"),
     ]
 
     def _zone_color(self, idx):
         return self.ZONE_COLORS[idx % len(self.ZONE_COLORS)]
 
-    # ── geometria osi stref ───────────────────────────────────────
     def _zrect(self):
         w = self.zone_area.get_allocated_width()
         h = self.zone_area.get_allocated_height()
         return self.VEL_PL, 4, w - self.VEL_PL - self.VEL_PR, h - 8
 
     def _zt2x(self, t):
-        ox, oy, cw, ch = self._zrect()
-        return ox + t * cw
+        ox, oy, cw, ch = self._zrect(); return ox + t * cw
 
     def _zx2t(self, x):
         ox, oy, cw, ch = self._zrect()
@@ -989,20 +1564,15 @@ class WaveformEditor(Gtk.Window):
     # ── rysowanie stref ───────────────────────────────────────────
     def _zone_draw(self, widget, cr):
         ox, oy, cw, ch = self._zrect()
-        w = widget.get_allocated_width()
-        h = widget.get_allocated_height()
 
-        # tło
         cr.set_source_rgb(0.10, 0.10, 0.12); cr.paint()
         cr.set_source_rgb(0.14, 0.14, 0.17)
         cr.rectangle(ox, oy, cw, ch); cr.fill()
 
         # miniatura waveformu
         if len(self.waveform) > 1:
-            cr.set_source_rgba(0.25, 0.55, 0.28, 0.5)
-            cr.set_line_width(0.8)
-            step = len(self.waveform) / cw
-            first = True
+            cr.set_source_rgba(0.25, 0.55, 0.28, 0.5); cr.set_line_width(0.8)
+            step = len(self.waveform) / cw; first = True
             for i in range(int(cw)):
                 idx = min(int(i * step), len(self.waveform)-1)
                 y = oy + ch/2 - self.waveform[idx] * (ch/2 - 4)
@@ -1010,12 +1580,10 @@ class WaveformEditor(Gtk.Window):
                 else:     cr.line_to(ox + i, y)
             cr.stroke()
 
-        # linia środkowa
-        cr.set_source_rgba(0.4, 0.4, 0.45, 0.4)
-        cr.set_line_width(0.5)
+        cr.set_source_rgba(0.4, 0.4, 0.45, 0.4); cr.set_line_width(0.5)
         cr.move_to(ox, oy+ch/2); cr.line_to(ox+cw, oy+ch/2); cr.stroke()
 
-        # strefy
+        # Rysuj strefy z typem przenikania
         lane_h = max(6, (ch - 20) // max(len(self.zones), 1))
         lane_h = min(lane_h, 22)
 
@@ -1025,47 +1593,75 @@ class WaveformEditor(Gtk.Window):
             x1 = self._zt2x(zone['t1'])
             zy  = oy + 4 + zi * (lane_h + 2)
             sel = (zi == self.zone_sel_idx)
+            xfade = zone.get('crossfade', self.zone_crossfade)
+
+            if xfade == 'crossfade' and zi > 0:
+                # Zachodzące — narysuj gradient nakładania
+                prev_zone = self.zones[zi-1]
+                px1 = self._zt2x(prev_zone['t1'])
+                if px1 > x0:  # strefy zachodzą
+                    # gradient w obszarze nałożenia
+                    ovx0 = x0; ovx1 = px1
+                    cr.set_source_rgba(r, g, b, 0.20)
+                    cr.rectangle(ovx0, zy-2, ovx1-ovx0, lane_h+4); cr.fill()
+                    # linia przenikania
+                    cr.set_source_rgba(1,1,1,0.4); cr.set_line_width(1); cr.set_dash([2,2])
+                    mid_x = (ovx0+ovx1)/2
+                    cr.move_to(mid_x, zy); cr.line_to(mid_x, zy+lane_h); cr.stroke()
+                    cr.set_dash([])
 
             # blok strefy
-            cr.set_source_rgba(r, g, b, 0.30 if not sel else 0.50)
+            cr.set_source_rgba(r, g, b, 0.35 if not sel else 0.55)
             cr.rectangle(x0, zy, x1-x0, lane_h); cr.fill()
-            cr.set_source_rgba(r, g, b, 0.85 if sel else 0.55)
+            cr.set_source_rgba(r, g, b, 0.9 if sel else 0.6)
             cr.set_line_width(2 if sel else 1)
             cr.rectangle(x0, zy, x1-x0, lane_h); cr.stroke()
+
+            # Ikona przenikania przy lewej krawędzi
+            if xfade == 'crossfade':
+                cr.set_source_rgba(1,0.8,0,0.9); cr.set_font_size(7)
+                cr.move_to(x0+1, zy+8); cr.show_text("⋊")
+            else:
+                cr.set_source_rgba(0.6,0.6,0.7,0.7); cr.set_font_size(7)
+                cr.move_to(x0+1, zy+8); cr.show_text("|")
 
             # uchwyty granic
             for hx in [x0, x1]:
                 cr.set_source_rgba(1, 1, 1, 0.8)
                 cr.rectangle(hx - 3, zy, 6, lane_h); cr.fill()
 
-            # przebiegi — mini ikony
+            # mini ikony przebiegów
             passes = zone.get('passes', [{'mode':'fwd','s':0.0,'e':1.0}])
-            n_pass = len(passes)
             rep    = zone.get('repeats', 1)
-            pw     = max(4, (x1 - x0 - 4) / max(n_pass * rep, 1))
+            pw     = max(4, (x1 - x0 - 4) / max(len(passes) * rep, 1))
             cr.set_font_size(7)
             for ri in range(rep):
                 for pi, pas in enumerate(passes):
-                    px = x0 + 2 + (ri * n_pass + pi) * pw
+                    px = x0 + 2 + (ri * len(passes) + pi) * pw
                     if px + pw > x1 - 1: break
-                    # kolor jaśniejszy dla parzystych powtórzeń
                     alpha = 0.9 if ri % 2 == 0 else 0.6
                     cr.set_source_rgba(r, g, b, alpha)
                     cr.rectangle(px, zy+2, pw-1, lane_h-4); cr.fill()
-                    # ikona trybu
                     lbl = self._pass_icon(pas['mode'])
                     cr.set_source_rgba(0, 0, 0, 0.9)
-                    cr.move_to(px+1, zy + lane_h - 3)
-                    cr.show_text(lbl)
+                    cr.move_to(px+1, zy + lane_h - 3); cr.show_text(lbl)
 
-            # etykieta strefy
-            label = f"Z{zi+1} ×{rep}"
-            cr.set_font_size(8)
-            cr.set_source_rgba(1, 1, 1, 0.9)
-            cr.move_to(x0 + 4, zy + lane_h - 3)
-            cr.show_text(label)
+            # Etykieta
+            label = f"Z{zi+1}×{rep}"
+            cr.set_font_size(8); cr.set_source_rgba(1, 1, 1, 0.9)
+            cr.move_to(x0 + 4, zy + lane_h - 3); cr.show_text(label)
 
-        # oś czasu
+        # End-to marker w obszarze stref
+        if len(self.waveform) > 1:
+            ex = self._zt2x(self.play_end_frac)
+            cr.set_source_rgba(1.0, 0.3, 0.3, 0.9)
+            cr.set_line_width(2); cr.set_dash([4,2])
+            cr.move_to(ex, oy); cr.line_to(ex, oy+ch); cr.stroke()
+            cr.set_dash([])
+            cr.set_font_size(7); cr.set_source_rgba(1,0.3,0.3,1)
+            cr.move_to(ex+2, oy+10); cr.show_text("END")
+
+        # Oś czasu
         cr.set_font_size(8); cr.set_source_rgb(0.6, 0.6, 0.65)
         for i in range(9):
             x = self._zt2x(i / 8)
@@ -1076,7 +1672,6 @@ class WaveformEditor(Gtk.Window):
                 ms = (i/8) * len(self.waveform) / self.sample_rate * 1000
                 cr.show_text(f"{ms:.0f}ms")
 
-        # panel przebiegów — nadpisuje dolną część
         if self.zone_sel_idx is not None:
             self._zone_draw_pass_panel(cr, ox, oy, cw, ch)
 
@@ -1086,30 +1681,23 @@ class WaveformEditor(Gtk.Window):
         return icons.get(mode, '?')
 
     def _zone_draw_pass_panel(self, cr, ox, oy, cw, ch):
-        """Rysuje dolny pasek z wyborem trybu przebiegów zaznaczonej strefy."""
         zi = self.zone_sel_idx
         if zi is None or zi >= len(self.zones): return
-        zone = self.zones[zi]
-        passes = zone.get('passes', [])
+        zone = self.zones[zi]; passes = zone.get('passes', [])
         r, g, b = self._zone_color(zi)
-
         panel_y = oy + ch - 18
         cr.set_source_rgba(0.08, 0.08, 0.12, 0.92)
         cr.rectangle(ox, panel_y, cw, 18); cr.fill()
-        cr.set_font_size(8)
-
-        lbl = f"Z{zi+1} przebiegi ({len(passes)}):"
-        cr.set_source_rgba(r, g, b, 1)
-        cr.move_to(ox+2, panel_y+12); cr.show_text(lbl)
-
+        cr.set_font_size(8); cr.set_source_rgba(r, g, b, 1)
+        cr.move_to(ox+2, panel_y+12)
+        cr.show_text(f"Z{zi+1} przebiegi ({len(passes)}):")
         for pi, pas in enumerate(passes):
             px = ox + 80 + pi * 52
             cr.set_source_rgba(r, g, b, 0.7)
             cr.rectangle(px, panel_y+1, 50, 16); cr.fill()
             cr.set_source_rgba(1,1,1,0.9)
             icon = self._pass_icon(pas['mode'])
-            s_pct = int(pas.get('s',0)*100)
-            e_pct = int(pas.get('e',1)*100)
+            s_pct = int(pas.get('s',0)*100); e_pct = int(pas.get('e',1)*100)
             cr.move_to(px+2, panel_y+12)
             cr.show_text(f"P{pi+1}:{icon} {s_pct}-{e_pct}%")
 
@@ -1117,27 +1705,18 @@ class WaveformEditor(Gtk.Window):
     HANDLE_W = 6
 
     def _zone_hit(self, x, oy, ch, zi, zone):
-        """Zwraca 'left'|'right'|'body'|None."""
         x0 = self._zt2x(zone['t0']); x1 = self._zt2x(zone['t1'])
-        lane_h = max(6, (ch-20)//max(len(self.zones),1)); lane_h=min(lane_h,22)
-        zy = oy + 4 + zi*(lane_h+2)
-        # sprawdź Y
-        if not (zy <= 999):  # zawsze true — checkujemy X
-            pass
         if abs(x - x0) <= self.HANDLE_W: return 'left'
         if abs(x - x1) <= self.HANDLE_W: return 'right'
-        if x0 <= x <= x1:                return 'body'
+        if x0 <= x <= x1:               return 'body'
         return None
 
     def _zone_press(self, widget, event):
         x, y = event.x, event.y
         ox, oy, cw, ch = self._zrect()
-
         if event.button == 3:
-            # PPM: usuń strefę pod kursorem
             for zi, zone in enumerate(self.zones):
-                hit = self._zone_hit(x, oy, ch, zi, zone)
-                if hit:
+                if self._zone_hit(x, oy, ch, zi, zone):
                     self.zones.pop(zi)
                     if self.zone_sel_idx == zi: self.zone_sel_idx = None
                     elif self.zone_sel_idx and self.zone_sel_idx > zi:
@@ -1145,9 +1724,7 @@ class WaveformEditor(Gtk.Window):
                     self.zone_area.queue_draw()
                     self._zone_refresh_pass_ui()
                     return
-
         if event.button == 1:
-            # sprawdź trafienie w istniejącą strefę
             for zi, zone in enumerate(self.zones):
                 hit = self._zone_hit(x, oy, ch, zi, zone)
                 if hit:
@@ -1156,12 +1733,12 @@ class WaveformEditor(Gtk.Window):
                     self.zone_area.queue_draw()
                     self._zone_refresh_pass_ui()
                     return
-            # nowa strefa
             t = self._zx2t(x)
             new_zone = {
                 't0': t, 't1': min(t+0.1, 1.0),
                 'repeats': 1,
                 'passes': [{'mode':'fwd','s':0.0,'e':1.0}],
+                'crossfade': self.zone_crossfade,
             }
             self.zones.append(new_zone)
             self.zone_sel_idx = len(self.zones)-1
@@ -1173,8 +1750,7 @@ class WaveformEditor(Gtk.Window):
         if self.zone_drag is None: return
         zi, hit, x_start, t0_start, t1_start = self.zone_drag
         dx_t = self._zx2t(event.x) - self._zx2t(x_start)
-        zone = self.zones[zi]
-        MIN_W = 0.01
+        zone = self.zones[zi]; MIN_W = 0.01
         if hit == 'left':
             zone['t0'] = max(0.0, min(t0_start + dx_t, zone['t1'] - MIN_W))
         elif hit == 'right':
@@ -1188,63 +1764,72 @@ class WaveformEditor(Gtk.Window):
     def _zone_release(self, widget, event):
         self.zone_drag = None
         self.zone_area.queue_draw()
+        self.store.update_zones(self.zones)
 
-    # ── panel przebiegów (pass_box) ───────────────────────────────
+    # ── panel przebiegów ──────────────────────────────────────────
     def _zone_refresh_pass_ui(self):
-        """Odświeża widgety w pass_box dla zaznaczonej strefy."""
         for child in self.pass_box.get_children():
             self.pass_box.remove(child)
-
         zi = self.zone_sel_idx
         if zi is None or zi >= len(self.zones):
             self.pass_box.show_all(); return
-
-        zone = self.zones[zi]
-        passes = zone.get('passes', [])
+        zone = self.zones[zi]; passes = zone.get('passes', [])
         r, g, b = self._zone_color(zi)
 
-        lbl = Gtk.Label(label=f"Z{zi+1} przebiegi:")
-        lbl.set_markup(f'<span foreground="#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"><b>Z{zi+1} przebiegi:</b></span>')
+        lbl = Gtk.Label()
+        lbl.set_markup(f'<span foreground="#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"><b>Z{zi+1}:</b></span>')
         self.pass_box.pack_start(lbl, False, False, 4)
 
+        # Typ przenikania dla tej konkretnej strefy
+        xf_lbl = Gtk.Label(label="⋊:")
+        xf_lbl.set_tooltip_text("Przenikanie tej strefy")
+        self.pass_box.pack_start(xf_lbl, False, False, 0)
+        xf_combo = Gtk.ComboBoxText()
+        xf_combo.append_text("ostre"); xf_combo.append_text("zachodzące")
+        cur_xf = zone.get('crossfade', self.zone_crossfade)
+        xf_combo.set_active(0 if cur_xf == 'sharp' else 1)
+        xf_combo.connect("changed", self._make_xfade_cb(zi))
+        self.pass_box.pack_start(xf_combo, False, False, 0)
+        self.pass_box.pack_start(_sep(), False,False,4)
+
         for pi, pas in enumerate(passes):
-            pf = Gtk.Frame()
-            pf.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+            pf = Gtk.Frame(); pf.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
             phb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
             phb.set_border_width(2); pf.add(phb)
-
             phb.pack_start(Gtk.Label(label=f"P{pi+1}:"), False, False, 0)
-
-            # combo trybu
             mc = Gtk.ComboBoxText()
             for mode_id, mode_lbl in self.PASS_MODES:
                 mc.append_text(mode_lbl)
-            # ustaw aktywny
             mode_ids = [m[0] for m in self.PASS_MODES]
             cur_mode = pas.get('mode','fwd')
-            if cur_mode in mode_ids:
-                mc.set_active(mode_ids.index(cur_mode))
+            if cur_mode in mode_ids: mc.set_active(mode_ids.index(cur_mode))
             mc.connect("changed", self._make_mode_cb(zi, pi, mode_ids))
             phb.pack_start(mc, False, False, 0)
-
-            # zakres start %
             phb.pack_start(Gtk.Label(label="od:"), False, False, 0)
             s_spin = Gtk.SpinButton()
             s_spin.set_range(0,99); s_spin.set_value(int(pas.get('s',0)*100))
             s_spin.set_increments(5,10); s_spin.set_width_chars(3)
             s_spin.connect("value-changed", self._make_range_cb(zi, pi, 's'))
             phb.pack_start(s_spin, False, False, 0)
-            phb.pack_start(Gtk.Label(label="%  do:"), False, False, 0)
+            phb.pack_start(Gtk.Label(label="% do:"), False, False, 0)
             e_spin = Gtk.SpinButton()
             e_spin.set_range(1,100); e_spin.set_value(int(pas.get('e',1)*100))
             e_spin.set_increments(5,10); e_spin.set_width_chars(3)
             e_spin.connect("value-changed", self._make_range_cb(zi, pi, 'e'))
             phb.pack_start(e_spin, False, False, 0)
             phb.pack_start(Gtk.Label(label="%"), False, False, 0)
-
             self.pass_box.pack_start(pf, False, False, 0)
 
         self.pass_box.show_all()
+
+    def _make_xfade_cb(self, zi):
+        def cb(combo):
+            mapping = {"ostre":"sharp","zachodzące":"crossfade"}
+            val = mapping.get(combo.get_active_text(),"sharp")
+            if zi < len(self.zones):
+                self.zones[zi]['crossfade'] = val
+                self.zone_area.queue_draw()
+        return cb
 
     def _make_mode_cb(self, zi, pi, mode_ids):
         def cb(combo):
@@ -1284,19 +1869,33 @@ class WaveformEditor(Gtk.Window):
         self.zones.clear(); self.zone_sel_idx=None
         self._zone_refresh_pass_ui(); self.zone_area.queue_draw()
 
-    # ── renderowanie stref → fala ─────────────────────────────────
+    # ── renderowanie stref → fala z crossfade ─────────────────────
+    def _apply_crossfade(self, parts: list, fade_samples: int = 512) -> np.ndarray:
+        """Łączy fragmenty z fade-in/out na złączach."""
+        if not parts:
+            return np.array([])
+        if len(parts) == 1:
+            return parts[0]
+        result = parts[0].copy()
+        for chunk in parts[1:]:
+            fl = min(fade_samples, len(result), len(chunk))
+            if fl > 1:
+                fade_out = np.linspace(1.0, 0.0, fl)
+                fade_in  = np.linspace(0.0, 1.0, fl)
+                result[-fl:] = result[-fl:] * fade_out + chunk[:fl] * fade_in
+                result = np.concatenate([result, chunk[fl:]])
+            else:
+                result = np.concatenate([result, chunk])
+        return result
+
     def _zone_extract_pass(self, wave, zone, pas):
-        """Wycina i przekształca fragment wg jednego przebiegu."""
         n = len(wave)
         i0 = int(zone['t0'] * n); i1 = int(zone['t1'] * n)
         if i1 <= i0: return np.array([])
-        seg = wave[i0:i1]
-        seg_n = len(seg)
-
+        seg = wave[i0:i1]; seg_n = len(seg)
         s_frac = pas.get('s', 0.0); e_frac = pas.get('e', 1.0)
         si = int(s_frac * seg_n); ei = int(e_frac * seg_n)
         si = max(0, min(si, seg_n-1)); ei = max(si+1, min(ei, seg_n))
-
         mode = pas.get('mode','fwd')
         if   mode == 'fwd':            chunk = seg[si:ei]
         elif mode == 'rev':            chunk = seg[si:ei][::-1]
@@ -1310,24 +1909,35 @@ class WaveformEditor(Gtk.Window):
         return chunk
 
     def _zone_build_wave(self):
-        """Buduje falę wynikową z listy stref wg trybu zone_mode."""
-        wave = self.waveform
+        wave = self._wave_trimmed()
         if len(wave) < 2: return np.array([])
         mode = self.zone_mode
+        use_xfade = (self.zone_crossfade == 'crossfade')
 
         if mode == 'sequential':
             parts = []
             for zone in self.zones:
-                rep   = zone.get('repeats', 1)
+                rep    = zone.get('repeats', 1)
                 passes = zone.get('passes', [{'mode':'fwd','s':0.0,'e':1.0}])
+                zone_xf = zone.get('crossfade', self.zone_crossfade) == 'crossfade'
+                zone_parts = []
                 for _ in range(rep):
                     for pas in passes:
                         chunk = self._zone_extract_pass(wave, zone, pas)
-                        if len(chunk): parts.append(chunk)
-            return np.concatenate(parts) if parts else wave.copy()
+                        if len(chunk): zone_parts.append(chunk)
+                if zone_parts:
+                    # przenikanie wewnątrz strefy
+                    if zone_xf and len(zone_parts) > 1:
+                        parts.append(self._apply_crossfade(zone_parts, 256))
+                    else:
+                        parts.append(np.concatenate(zone_parts))
+            if not parts: return wave.copy()
+            # przenikanie między strefami
+            if use_xfade and len(parts) > 1:
+                return self._apply_crossfade(parts, 512)
+            return np.concatenate(parts)
 
         elif mode == 'layer':
-            # nakładanie stref (blend amplitudowy) na oryginalną długość
             n = len(wave); out = np.zeros(n); weight = np.zeros(n)
             for zone in self.zones:
                 i0 = int(zone['t0']*n); i1 = int(zone['t1']*n)
@@ -1341,14 +1951,19 @@ class WaveformEditor(Gtk.Window):
                         if len(c): zone_chunks.append(c)
                 if not zone_chunks: continue
                 blended = np.concatenate(zone_chunks)
-                # dopasuj do długości i0:i1
-                seg_len = i1 - i0
-                if len(blended) >= seg_len:
-                    blended = blended[:seg_len]
-                else:
-                    blended = np.resize(blended, seg_len)
+                seg_len = len(out[i0:i1])  # actual slot length (may be < i1-i0 near end)
+                if len(blended) >= seg_len: blended = blended[:seg_len]
+                else: blended = np.resize(blended, seg_len)
+                # Crossfade przy nakładaniu
+                xf = zone.get('crossfade', self.zone_crossfade) == 'crossfade'
+                if xf:
+                    env = np.ones(seg_len)
+                    fl = min(256, seg_len//4)
+                    if fl > 1:
+                        env[:fl]  = np.linspace(0, 1, fl)
+                        env[-fl:] = np.linspace(1, 0, fl)
+                    blended *= env
                 out[i0:i1] += blended; weight[i0:i1] += 1
-            # gdzie brak stref — oryginał
             no_zone = weight == 0
             out[no_zone] = wave[no_zone]; weight[no_zone] = 1
             out /= weight
@@ -1356,11 +1971,8 @@ class WaveformEditor(Gtk.Window):
             return out/mx if mx > 1e-9 else out
 
         elif mode == 'nested':
-            # strefy zagnieżdżone: sortuj wg rozmiaru malejąco
-            # mniejsze nakrywają większe
             n = len(wave); out = wave.copy()
-            for zone in sorted(self.zones,
-                               key=lambda z: abs(z['t1']-z['t0']), reverse=True):
+            for zone in sorted(self.zones, key=lambda z: abs(z['t1']-z['t0']), reverse=True):
                 i0 = int(zone['t0']*n); i1 = int(zone['t1']*n)
                 if i1 <= i0: continue
                 rep    = zone.get('repeats', 1)
@@ -1372,9 +1984,17 @@ class WaveformEditor(Gtk.Window):
                         if len(c): chunks.append(c)
                 if not chunks: continue
                 blended = np.concatenate(chunks)
-                seg_len = i1 - i0
+                seg_len = len(out[i0:i1])  # actual slot length
                 if len(blended) >= seg_len: blended = blended[:seg_len]
                 else: blended = np.resize(blended, seg_len)
+                xf = zone.get('crossfade', self.zone_crossfade) == 'crossfade'
+                if xf:
+                    fl = min(128, seg_len//4)
+                    if fl > 1:
+                        env = np.ones(seg_len)
+                        env[:fl]  = np.linspace(0,1,fl)
+                        env[-fl:] = np.linspace(1,0,fl)
+                        blended *= env
                 out[i0:i1] = blended
             mx = np.max(np.abs(out))
             return out/mx if mx > 1e-9 else out
@@ -1386,29 +2006,34 @@ class WaveformEditor(Gtk.Window):
         result = self._zone_build_wave()
         if len(result) < 2: return
         self.zone_rendered = result
-        pygame.mixer.music.load(self._tmp(result)); pygame.mixer.music.play()
-        self._st(f"Strefy odtworzone: {len(result)} próbek  {len(result)/self.sample_rate*1000:.0f}ms")
+        self._play_wave(result)
+        self._st(f"Strefy odtworzone: {len(result)} próbek  "
+                 f"{len(result)/self.sample_rate*1000:.0f}ms  "
+                 f"[{self.zone_crossfade}]")
 
     def _zone_stop(self, widget=None):
         if PYGAME_OK: pygame.mixer.music.stop()
 
     def _zone_render_to_wave(self, widget=None):
-        """Renderuje strefy i ustawia wynik jako nową falę bazową."""
         result = self._zone_build_wave()
         if len(result) < 2: return
-        self._set_wave(result)
+        self._set_wave(result, source="zone_render")
         self._st(f"Strefy → nowa fala: {len(result)} próbek")
 
+    # ══════════════════════════════════════════════════════════════
+    #  Velocity draw
+    # ══════════════════════════════════════════════════════════════
     def _vel_draw(self, widget, cr):
         ox,oy,cw,ch=self._vrect()
         cr.set_source_rgb(0.10,0.10,0.12); cr.paint()
         cr.set_source_rgb(0.14,0.14,0.17); cr.rectangle(ox,oy,cw,ch); cr.fill()
         cr.set_font_size(8)
-        for pct in [0,25,50,75,100]:
-            v=pct/100.; y=self._vv2y(v)
-            cr.set_source_rgba(0.3,0.3,0.35,0.5); cr.set_line_width(0.5)
+        for spd,lbl in [(4.0,"4×"),(2.0,"2×"),(1.0,"1×"),(0.5,"½×"),(0.25,"¼×")]:
+            y=self._vv2y(spd)
+            alpha=0.7 if spd==1.0 else 0.35
+            cr.set_source_rgba(0.3,0.3,0.35,alpha); cr.set_line_width(0.5 if spd!=1.0 else 1.2)
             cr.move_to(ox,y); cr.line_to(ox+cw,y); cr.stroke()
-            cr.set_source_rgb(0.55,0.55,0.55); cr.move_to(2,y+3); cr.show_text(f"{pct}%")
+            cr.set_source_rgb(0.55,0.55,0.55); cr.move_to(2,y+3); cr.show_text(lbl)
         nodes=sorted(self.vel_nodes,key=lambda n:n[0])
         if nodes:
             cr.set_source_rgba(0.25,0.65,0.40,0.18)
@@ -1429,7 +2054,7 @@ class WaveformEditor(Gtk.Window):
             cr.set_source_rgb(0,0,0); cr.arc(x,y,5,0,6.28); cr.set_line_width(1); cr.stroke()
         if not self.vel_apply:
             cr.set_source_rgba(0.8,0.2,0.2,0.55); cr.set_font_size(11)
-            cr.move_to(ox+cw/2-40,oy+ch/2+5); cr.show_text("VELOCITY OFF")
+            cr.move_to(ox+cw/2-40,oy+ch/2+5); cr.show_text("SPEED OFF")
 
     def _vel_nearest(self, x, y, thresh=12):
         best=None; best_d=thresh**2
@@ -1465,31 +2090,64 @@ class WaveformEditor(Gtk.Window):
         try: self.vel_drag_idx=self.vel_nodes.index(old)
         except ValueError: self.vel_drag_idx=None
         self.vel_area.queue_draw(); self._rerender()
+        self.store.update_vel(self.vel_nodes)
 
-    def _vel_release(self, widget, event): self.vel_drag_idx=None; self.vel_area.queue_draw()
+    def _vel_release(self, widget, event):
+        self.vel_drag_idx=None; self.vel_area.queue_draw()
+
     def _vel_reset(self, w=None):
-        self.vel_nodes=[[0.0,1.0],[1.0,1.0]]; self.vel_area.queue_draw(); self._rerender()
+        self.vel_nodes=[[0.0,1.0],[1.0,1.0]]
+        self.vel_area.queue_draw(); self._rerender()
 
     def _vel_curve(self, n):
+        """Zwraca krzywą prędkości (speed) w n punktach. Wartości: 0.25..4.0, 1.0=normalna."""
         nodes=sorted(self.vel_nodes,key=lambda nd:nd[0])
         ts=np.array([nd[0] for nd in nodes]); vs=np.array([nd[1] for nd in nodes])
         return np.interp(np.linspace(0.,1.,n),ts,vs)
+
+    def _apply_speed_warp(self, wave):
+        """Przepróbkowuje falę zgodnie z krzywą prędkości.
+        v>1 = przyspieszenie (wyjście krótsze), v<1 = zwolnienie (wyjście dłuższe).
+        Długość wyjściowa = n / mean(speed), zaokrąglona do int."""
+        n = len(wave)
+        if n < 2: return wave
+        speed = self._vel_curve(n)           # prędkość w każdym punkcie wejścia
+        # Cumsum pozycji wyjściowej: całka prędkości po czasie
+        # position[i] = ile próbek wyjściowych odpowiada wejściu [0..i]
+        pos = np.cumsum(speed)               # rosnąca, pos[-1] = suma prędkości
+        pos = pos / pos[-1]                  # normalizuj do [0..1]
+        n_out = max(2, int(round(n / np.mean(speed))))
+        t_out = np.linspace(0., 1., n_out)
+        # Odwróć mapowanie: dla każdego t_out znajdź odpowiedni indeks wejścia
+        t_in = np.interp(t_out, pos, np.linspace(0., 1., n))
+        return np.interp(t_in * (n-1), np.arange(n), wave)
 
     # ══════════════════════════════════════════════════════════════
     #  Odtwarzanie
     # ══════════════════════════════════════════════════════════════
     def on_play(self, w=None):
         if len(self.waveform)<2 or not PYGAME_OK: return
-        pygame.mixer.music.load(self._tmp(self.waveform)); pygame.mixer.music.play()
+        self._play_wave(self._wave_trimmed())
+
     def on_stop(self, w=None):
         if PYGAME_OK: pygame.mixer.music.stop()
+
     def _toggle_live(self, w=None):
-        self.live_play=not self.live_play; self._st("Live: "+("ON" if self.live_play else "OFF"))
+        self.live_play=not self.live_play
+        self._st("Live: "+("ON" if self.live_play else "OFF"))
+
     def _play_now(self):
         if len(self.waveform)<2 or not PYGAME_OK: return
-        pygame.mixer.music.load(self._tmp(self.waveform)); pygame.mixer.music.play()
+        self._play_wave(self._wave_trimmed())
+
+    def _play_wave(self, wave: np.ndarray):
+        if not PYGAME_OK or len(wave) < 2: return
+        p = self._tmp(wave)
+        pygame.mixer.music.load(p)
+        pygame.mixer.music.play()
+
     def _tmp(self, wave):
-        p=os.path.join(tempfile.gettempdir(),"ed_waves3.wav")
+        p=os.path.join(tempfile.gettempdir(),"ed_waves4.wav")
         wav.write(p,self.sample_rate,(wave*32767).astype(np.int16)); return p
 
     # ══════════════════════════════════════════════════════════════
@@ -1499,7 +2157,7 @@ class WaveformEditor(Gtk.Window):
         dlg=Gtk.FileChooserDialog(title="Zapisz WAV",parent=self,action=Gtk.FileChooserAction.SAVE)
         dlg.add_buttons(Gtk.STOCK_CANCEL,Gtk.ResponseType.CANCEL,Gtk.STOCK_SAVE,Gtk.ResponseType.OK)
         if dlg.run()==Gtk.ResponseType.OK:
-            wav.write(dlg.get_filename(),self.sample_rate,(self.waveform*32767).astype(np.int16))
+            wav.write(dlg.get_filename(),self.sample_rate,(self._wave_trimmed()*32767).astype(np.int16))
         dlg.destroy()
 
     def on_import_wav(self, widget):
@@ -1510,7 +2168,8 @@ class WaveformEditor(Gtk.Window):
             if len(data.shape)==2: data=data.mean(axis=1)
             data=data.astype(float); mx=np.max(np.abs(data))
             if mx>0: data/=mx
-            self.sample_rate=sr; self._set_wave(data)
+            self.sample_rate=sr
+            self._set_wave(data, source="import", wtype="wav")
         dlg.destroy()
 
     # ══════════════════════════════════════════════════════════════
